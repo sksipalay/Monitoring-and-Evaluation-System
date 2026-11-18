@@ -1,0 +1,160 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function userDocExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn() && request.auth.token.email == 'stephenkent.sipalay@municipalityofbula.gov.ph';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (isSignedIn() && userDocExists() && userRole() == 'ADMINISTRATOR');
+    }
+
+    function isEncoder() {
+      return isAdmin() || (isSignedIn() && userDocExists() && userRole() == 'ENCODER');
+    }
+
+    function isAuthorizedViewer() {
+      return isEncoder() || (isSignedIn() && userDocExists() && userRole() == 'VIEWER');
+    }
+
+    function isValidUserAccount(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'uid', 'email', 'displayName', 'role', 'officeId', 'officeName', 'position', 'isActive', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid.size() <= 128
+        && data.email is string && data.email.size() <= 200
+        && data.displayName is string && data.displayName.size() <= 160
+        && data.role in ['ADMINISTRATOR', 'ENCODER', 'VIEWER']
+        && data.isActive is bool;
+    }
+
+    function isValidProgram(data) {
+      return data.keys().hasAll(['fiscalYear', 'aipRefCode', 'title', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'fiscalYear', 'aipRefCode', 'title', 'sector', 'officeId', 'officeName', 'parentProgramId', 'orderIndex', 'createdAt', 'updatedAt'])
+        && data.fiscalYear is string && data.fiscalYear.size() <= 8
+        && data.aipRefCode is string && data.aipRefCode.size() <= 64
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 300;
+    }
+
+    function isValidActivity(data) {
+      return data.keys().hasAll(['programId', 'fiscalYear', 'referenceNumber', 'description', 'status', 'createdAt', 'updatedAt'])
+        && data.programId is string && data.programId.size() <= 128
+        && data.fiscalYear is string && data.fiscalYear.size() <= 8
+        && data.referenceNumber is string && data.referenceNumber.size() <= 64
+        && data.description is string && data.description.size() > 0 && data.description.size() <= 600
+        && data.status in ['COMPLETED', 'ON-GOING', 'PENDING', 'NOT IMPLEMENTED']
+        && data.ps is number && data.ps >= 0
+        && data.mooe is number && data.mooe >= 0
+        && data.co is number && data.co >= 0;
+    }
+
+    function isValidRemark(data) {
+      return data.keys().hasAll(['activityId', 'authorUid', 'observation', 'createdAt'])
+        && data.activityId is string && data.activityId.size() <= 128
+        && data.authorUid == request.auth.uid
+        && data.observation is string && data.observation.size() > 0 && data.observation.size() <= 1500;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['userUid', 'action', 'entityType', 'summary', 'timestamp'])
+        && data.userUid == request.auth.uid
+        && data.action is string && data.action.size() <= 32
+        && data.entityType is string && data.entityType.size() <= 64
+        && data.summary is string && data.summary.size() <= 300;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isAdmin() || (isSignedIn() && request.auth.uid == userId));
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && isAdmin() && isValidUserAccount(incoming());
+      allow update: if isValidId(userId) && isAdmin() && isValidUserAccount(incoming());
+      allow delete: if isValidId(userId) && isAdmin() && userId != request.auth.uid;
+    }
+
+    match /offices/{officeId} {
+      allow get: if isValidId(officeId) && isAuthorizedViewer();
+      allow list: if isAuthorizedViewer();
+      allow create, update, delete: if isValidId(officeId) && isAdmin();
+    }
+
+    match /fiscalYears/{fyId} {
+      allow get: if isValidId(fyId) && isAuthorizedViewer();
+      allow list: if isAuthorizedViewer();
+      allow create, update, delete: if isValidId(fyId) && isAdmin();
+    }
+
+    match /programs/{programId} {
+      allow get: if isValidId(programId) && isAuthorizedViewer();
+      allow list: if isAuthorizedViewer();
+      allow create: if isValidId(programId) && isAdmin() && isValidProgram(incoming());
+      allow update: if isValidId(programId) && isAdmin() && isValidProgram(incoming());
+      allow delete: if isValidId(programId) && isAdmin();
+    }
+
+    match /activities/{activityId} {
+      allow get: if isValidId(activityId) && isAuthorizedViewer();
+      allow list: if isAuthorizedViewer();
+      allow create: if isValidId(activityId) && isAdmin() && isValidActivity(incoming());
+      allow update: if isValidId(activityId) && isValidActivity(incoming()) && (
+        isAdmin() ||
+        (isEncoder() && incoming().diff(existing()).affectedKeys().hasOnly(['monthly', 'status', 'remarks', 'updatedBy', 'updatedAt']))
+      );
+      allow delete: if isValidId(activityId) && isAdmin();
+    }
+
+    match /remarksLogs/{remarkId} {
+      allow get: if isValidId(remarkId) && isAuthorizedViewer();
+      allow list: if isAuthorizedViewer();
+      allow create: if isValidId(remarkId) && isEncoder() && isValidRemark(incoming());
+      allow update, delete: if isValidId(remarkId) && isAdmin();
+    }
+
+    match /uploadedDocuments/{docId} {
+      allow get: if isValidId(docId) && isAuthorizedViewer();
+      allow list: if isAuthorizedViewer();
+      allow create: if isValidId(docId) && isAdmin();
+      allow update, delete: if isValidId(docId) && isAdmin();
+    }
+
+    match /auditLogs/{logId} {
+      allow get: if isValidId(logId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(logId) && isAuthorizedViewer() && isValidAuditLog(incoming());
+      allow update, delete: if false;
+    }
+
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId) && isAuthorizedViewer();
+      allow list: if isAuthorizedViewer();
+      allow create, update, delete: if isValidId(settingId) && isAdmin();
+    }
+  }
+}

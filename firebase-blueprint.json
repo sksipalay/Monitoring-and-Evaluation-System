@@ -1,0 +1,181 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Authorized LGU Bula personnel account with role-based access control.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "displayName": { "type": "string", "maxLength": 160 },
+        "role": { "type": "string", "enum": ["ADMINISTRATOR", "ENCODER", "VIEWER"] },
+        "officeId": { "type": "string", "maxLength": 128 },
+        "officeName": { "type": "string", "maxLength": 200 },
+        "position": { "type": "string", "maxLength": 160 },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName", "role", "isActive", "createdAt", "updatedAt"]
+    },
+    "Office": {
+      "title": "Office",
+      "description": "Implementing office or department in LGU Bula.",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "maxLength": 32 },
+        "name": { "type": "string", "maxLength": 200 },
+        "headName": { "type": "string", "maxLength": 160 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["code", "name", "createdAt"]
+    },
+    "FiscalYear": {
+      "title": "FiscalYear",
+      "description": "Budget and monitoring fiscal year.",
+      "type": "object",
+      "properties": {
+        "year": { "type": "string", "pattern": "^[0-9]{4}$", "maxLength": 4 },
+        "label": { "type": "string", "maxLength": 32 },
+        "isActive": { "type": "boolean" },
+        "isDefault": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["year", "label", "isActive", "isDefault", "createdAt"]
+    },
+    "Program": {
+      "title": "Program",
+      "description": "LGU Program or Subprogram grouping Projects and Activities.",
+      "type": "object",
+      "properties": {
+        "fiscalYear": { "type": "string", "maxLength": 8 },
+        "aipRefCode": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 300 },
+        "sector": { "type": "string", "maxLength": 120 },
+        "officeId": { "type": "string", "maxLength": 128 },
+        "officeName": { "type": "string", "maxLength": 200 },
+        "parentProgramId": { "type": "string", "maxLength": 128 },
+        "orderIndex": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["fiscalYear", "aipRefCode", "title", "createdAt", "updatedAt"]
+    },
+    "Activity": {
+      "title": "Activity",
+      "description": "Project or Activity record containing budget allocations, monthly targets, monthly actuals, and status.",
+      "type": "object",
+      "properties": {
+        "programId": { "type": "string", "maxLength": 128 },
+        "subprogramId": { "type": "string", "maxLength": 128 },
+        "fiscalYear": { "type": "string", "maxLength": 8 },
+        "referenceNumber": { "type": "string", "maxLength": 64 },
+        "description": { "type": "string", "maxLength": 600 },
+        "targetOutputs": { "type": "string", "maxLength": 500 },
+        "officeId": { "type": "string", "maxLength": 128 },
+        "officeName": { "type": "string", "maxLength": 200 },
+        "budgetClassification": { "type": "string", "maxLength": 40 },
+        "ps": { "type": "number" },
+        "mooe": { "type": "number" },
+        "co": { "type": "number" },
+        "withheldAmount": { "type": "number" },
+        "supplementalBudget1": { "type": "number" },
+        "supplementalBudget2": { "type": "number" },
+        "supplementalBudget3": { "type": "number" },
+        "supplementalBudget4": { "type": "number" },
+        "supplementalBudget5": { "type": "number" },
+        "monthly": { "type": "object" },
+        "status": { "type": "string", "enum": ["COMPLETED", "ON-GOING", "PENDING", "NOT IMPLEMENTED"] },
+        "remarks": { "type": "string", "maxLength": 1000 },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["programId", "fiscalYear", "referenceNumber", "description", "status", "createdAt", "updatedAt"]
+    },
+    "RemarkLog": {
+      "title": "RemarkLog",
+      "description": "Monitoring observation entry attached to an activity.",
+      "type": "object",
+      "properties": {
+        "activityId": { "type": "string", "maxLength": 128 },
+        "authorUid": { "type": "string", "maxLength": 128 },
+        "authorName": { "type": "string", "maxLength": 160 },
+        "authorRole": { "type": "string", "enum": ["ADMINISTRATOR", "ENCODER", "VIEWER"] },
+        "observation": { "type": "string", "maxLength": 1500 },
+        "monitoringDate": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["activityId", "authorUid", "observation", "createdAt"]
+    },
+    "UploadedDocument": {
+      "title": "UploadedDocument",
+      "description": "Metadata of imported Excel Monitoring Template files.",
+      "type": "object",
+      "properties": {
+        "fileName": { "type": "string", "maxLength": 255 },
+        "fileSize": { "type": "number" },
+        "fiscalYear": { "type": "string", "maxLength": 8 },
+        "recordsImported": { "type": "number" },
+        "uploadedByUid": { "type": "string", "maxLength": 128 },
+        "uploadedByName": { "type": "string", "maxLength": 160 },
+        "uploadedAt": { "type": "string", "format": "date-time" },
+        "notes": { "type": "string", "maxLength": 500 }
+      },
+      "required": ["fileName", "fiscalYear", "recordsImported", "uploadedByUid", "uploadedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable audit trail of system actions.",
+      "type": "object",
+      "properties": {
+        "userUid": { "type": "string", "maxLength": 128 },
+        "userName": { "type": "string", "maxLength": 160 },
+        "userEmail": { "type": "string", "maxLength": 200 },
+        "userRole": { "type": "string", "enum": ["ADMINISTRATOR", "ENCODER", "VIEWER"] },
+        "action": { "type": "string", "maxLength": 32 },
+        "entityType": { "type": "string", "maxLength": 64 },
+        "entityId": { "type": "string", "maxLength": 128 },
+        "summary": { "type": "string", "maxLength": 300 },
+        "details": { "type": "string", "maxLength": 1500 },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userUid", "action", "entityType", "summary", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Authorized personnel profiles and RBAC role assignments."
+    },
+    "/offices/{officeId}": {
+      "schema": { "$ref": "#/entities/Office" },
+      "description": "Implementing municipal offices and departments."
+    },
+    "/fiscalYears/{fiscalYearId}": {
+      "schema": { "$ref": "#/entities/FiscalYear" },
+      "description": "Fiscal year definitions."
+    },
+    "/programs/{programId}": {
+      "schema": { "$ref": "#/entities/Program" },
+      "description": "LGU Programs and Subprograms."
+    },
+    "/activities/{activityId}": {
+      "schema": { "$ref": "#/entities/Activity" },
+      "description": "Projects and Activities with budgets and monthly monitoring data."
+    },
+    "/remarksLogs/{remarkId}": {
+      "schema": { "$ref": "#/entities/RemarkLog" },
+      "description": "Monitoring remarks and field observations."
+    },
+    "/uploadedDocuments/{docId}": {
+      "schema": { "$ref": "#/entities/UploadedDocument" },
+      "description": "Excel template import logs."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "System audit logs."
+    }
+  }
+}

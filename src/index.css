@@ -1,0 +1,203 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: 'Inter', 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --font-display: 'Manrope', 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  :root {
+    --font-display: 'Manrope', 'Inter', system-ui, -apple-system, sans-serif;
+    --font-sans: 'Inter', 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+
+    --text-page-title: 1.625rem;
+    --text-section-heading: 1.1875rem;
+    --text-card-title: 1rem;
+    --text-body: 0.875rem;
+    --text-table: 0.8125rem;
+    --text-supporting: 0.75rem;
+    --leading-tight: 1.25;
+    --leading-normal: 1.5;
+    --leading-relaxed: 1.6;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: var(--leading-normal);
+    font-weight: 400;
+    background-color: #f8fafc;
+    color: #0f172a;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html.dark body {
+    background-color: #020617;
+    color: #f1f5f9;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+  }
+
+  .font-mono,
+  code,
+  pre,
+  kbd,
+  samp {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  a:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+  }
+
+  html.dark button:focus-visible,
+  html.dark input:focus-visible,
+  html.dark select:focus-visible,
+  html.dark textarea:focus-visible,
+  html.dark a:focus-visible {
+    outline-color: #38bdf8;
+  }
+}
+
+@keyframes fadeSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeSlideIn 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in {
+    animation: none;
+  }
+}
+
+.print-only {
+  display: none;
+}
+
+@page {
+  size: auto;
+  margin: 12mm;
+}
+
+@media print {
+  aside,
+  header,
+  nav,
+  .no-print,
+  [role="dialog"],
+  [aria-modal="true"] {
+    display: none !important;
+  }
+
+  .print-only {
+    display: block !important;
+  }
+
+  .print-shell-content {
+    padding-left: 0 !important;
+    margin-left: 0 !important;
+    width: 100% !important;
+  }
+
+  main {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow: visible !important;
+  }
+
+  body,
+  html.dark body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  html.dark main,
+  html.dark main * {
+    color: #0f172a !important;
+    border-color: #cbd5e1 !important;
+  }
+
+  html.dark main section,
+  html.dark main div.rounded-xl,
+  html.dark main div.rounded-lg,
+  html.dark main table,
+  html.dark main thead,
+  html.dark main tbody,
+  html.dark main tfoot {
+    background-color: #ffffff !important;
+  }
+
+  main section,
+  main .rounded-xl,
+  main .rounded-lg {
+    box-shadow: none !important;
+  }
+
+  main .overflow-x-auto,
+  main .overflow-hidden,
+  main [class*="max-h-"] {
+    overflow: visible !important;
+    max-height: none !important;
+  }
+
+  main table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    font-size: 9.5pt !important;
+  }
+
+  main thead {
+    display: table-header-group;
+  }
+
+  main tfoot {
+    display: table-row-group;
+  }
+
+  main tr,
+  .print-avoid-break {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .print-sheet,
+  html.dark .print-sheet {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+  }
+}
