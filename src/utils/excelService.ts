@@ -17,13 +17,17 @@ import {
   MONTHS,
   calculateRevisedBudgetByFund,
   computeActivityMetrics,
+  computeGadComplianceSummary,
   createEmptyMonthlyData,
   isPersonnelServicesFund,
   round2,
   safeNum,
+  summarizeProgram,
 } from './calculations';
 import {
+  buildReportTableData,
   buildTemplatePlaceholderContext,
+  dataUrlToPngBytes,
   filterActivitiesForReport,
   formatFiscalYearDisplay,
   formatPhDate,
@@ -232,6 +236,33 @@ function cloneCellStyle(src: ExcelJS.Cell, dest: ExcelJS.Cell) {
   }
 }
 
+function shiftMergesBelowRow(
+  ws: ExcelJS.Worksheet,
+  insertAtRow: number,
+  rowDelta: number
+): string[] {
+  if (rowDelta <= 0) return [];
+  const merges: string[] = Array.isArray((ws as unknown as { model?: { merges?: string[] } }).model?.merges)
+    ? [...((ws as unknown as { model: { merges: string[] } }).model.merges)]
+    : [];
+  const shiftedMerges: string[] = [];
+  for (const range of merges) {
+    const m = /^([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(range);
+    if (!m) continue;
+    const r1 = Number(m[2]);
+    const r2 = Number(m[4]);
+    if (r1 >= insertAtRow) {
+      try {
+        ws.unMergeCells(range);
+      } catch {
+        // ignore if already unmerged
+      }
+      shiftedMerges.push(`${m[1]}${r1 + rowDelta}:${m[3]}${r2 + rowDelta}`);
+    }
+  }
+  return shiftedMerges;
+}
+
 export async function populateOfficialExcelTemplate(options: {
   templateBuffer: ArrayBuffer | Uint8Array;
   fiscalYear: string;
@@ -259,7 +290,9 @@ export async function populateOfficialExcelTemplate(options: {
 
   const bytes = templateBuffer instanceof Uint8Array ? templateBuffer : new Uint8Array(templateBuffer);
   const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  await wb.xlsx.load(
+    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+  );
 
   const fyPrograms = programs.filter((p) => fiscalYear === 'ALL' || p.fiscalYear === fiscalYear);
   const fyActivities = activities.filter((a) => fiscalYear === 'ALL' || a.fiscalYear === fiscalYear);
@@ -297,16 +330,19 @@ export async function populateOfficialExcelTemplate(options: {
     for (let r = 1; r <= scanMax; r++) {
       const row = ws.getRow(r);
       let score = 0;
+      let distinctCols = 0;
       row.eachCell((cell) => {
+        if (cell.isMerged && cell.master !== cell) return;
         const txt = cellToString(cell.value).toLowerCase();
         if (!txt) return;
-        if (txt.includes('description') || txt.includes('ppa') || txt.includes('activity')) score += 3;
+        distinctCols++;
+        if (txt.includes('description') || txt.includes('ppa') || txt.includes('activity') || txt.includes('program title')) score += 3;
         if (txt.includes('ref') || txt.includes('aip')) score += 2;
         if (txt.includes('output') || txt.includes('office')) score += 2;
         if (txt === 'gf' || txt === 'ps' || txt === 'mooe' || txt === 'co') score += 2;
-        if (txt.includes('approved') || txt.includes('revised') || txt.includes('status')) score += 2;
+        if (txt.includes('approved') || txt.includes('revised') || txt.includes('status') || txt.includes('expenditure')) score += 2;
       });
-      if (score > bestScore) {
+      if (distinctCols >= 2 && score > bestScore) {
         bestScore = score;
         headerRowIdx = r;
       }
@@ -315,9 +351,8 @@ export async function populateOfficialExcelTemplate(options: {
     if (headerRowIdx > 0 && bestScore >= 3) {
       const hdrRow = ws.getRow(headerRowIdx);
       const superRow = headerRowIdx > 1 ? ws.getRow(headerRowIdx - 1) : null;
-      const totalCols = Math.max(hdrRow.cellCount, superRow?.cellCount ?? 0);
+      const totalCols = Math.max(hdrRow.cellCount, superRow?.cellCount ?? 0, 1);
 
-      // Map columns to field names
       const colFieldMap: { col: number; field: string; monthKey?: MonthKey; monthProp?: 'pt' | 'ft' | 'pa' | 'fa' }[] = [];
       let lastSuperMonth: MonthKey | null = null;
       for (let c = 1; c <= totalCols; c++) {
@@ -345,22 +380,23 @@ export async function populateOfficialExcelTemplate(options: {
         }
 
         if (matchedMonth && !`${rawSuper} ${rawSub}`.includes('annual')) {
-          if (rawSub.includes('physical') && rawSub.includes('target')) {
+          if (rawSub.includes('phys') && rawSub.includes('target')) {
             colFieldMap.push({ col: c, field: 'monthly', monthKey: matchedMonth, monthProp: 'pt' });
-          } else if (rawSub.includes('financial') && rawSub.includes('target')) {
+          } else if (rawSub.includes('fin') && rawSub.includes('target')) {
             colFieldMap.push({ col: c, field: 'monthly', monthKey: matchedMonth, monthProp: 'ft' });
-          } else if (rawSub.includes('physical') && rawSub.includes('actual')) {
+          } else if (rawSub.includes('phys') && rawSub.includes('actual')) {
             colFieldMap.push({ col: c, field: 'monthly', monthKey: matchedMonth, monthProp: 'pa' });
-          } else if (rawSub.includes('financial') && rawSub.includes('actual')) {
+          } else if (rawSub.includes('fin') && rawSub.includes('actual')) {
             colFieldMap.push({ col: c, field: 'monthly', monthKey: matchedMonth, monthProp: 'fa' });
           }
           continue;
         }
 
-        if (rawSub.includes('aip') || rawSub.includes('ref')) colFieldMap.push({ col: c, field: 'ref' });
-        else if (rawSub.includes('description') || rawSub === 'ppa' || rawSub.includes('project/activity')) colFieldMap.push({ col: c, field: 'description' });
+        if (rawSub === '#' || rawSub === 'no.' || rawSub === 'no' || rawSub === 'item') colFieldMap.push({ col: c, field: 'index' });
+        else if (rawSub.includes('aip') || rawSub.includes('ref')) colFieldMap.push({ col: c, field: 'ref' });
+        else if (rawSub.includes('description') || rawSub === 'ppa' || rawSub.includes('project/activity') || rawSub.includes('gad-attributed')) colFieldMap.push({ col: c, field: 'description' });
         else if (rawSub === 'program' || rawSub.includes('program title')) colFieldMap.push({ col: c, field: 'program' });
-        else if (rawSub.includes('output')) colFieldMap.push({ col: c, field: 'targetOutputs' });
+        else if (rawSub === 'ppas' || rawSub.includes('output')) colFieldMap.push({ col: c, field: 'targetOutputs' });
         else if (rawSub.includes('office') || rawSub.includes('implementing') || rawSub.includes('unit')) colFieldMap.push({ col: c, field: 'office' });
         else if (rawSub.includes('source') || rawSub === 'fund') colFieldMap.push({ col: c, field: 'sourceOfFund' });
         else if (rawSub.includes('classif')) colFieldMap.push({ col: c, field: 'classification' });
@@ -376,17 +412,168 @@ export async function populateOfficialExcelTemplate(options: {
         else if (rawSub.includes('supplemental') && rawSub.includes('4')) colFieldMap.push({ col: c, field: 'supp4' });
         else if (rawSub.includes('supplemental') && rawSub.includes('5')) colFieldMap.push({ col: c, field: 'supp5' });
         else if (rawSub.includes('revised')) colFieldMap.push({ col: c, field: 'revised' });
-        else if (rawSub.includes('annual') && rawSub.includes('phys') && rawSub.includes('target')) colFieldMap.push({ col: c, field: 'annPT' });
-        else if (rawSub.includes('annual') && rawSub.includes('phys') && rawSub.includes('actual')) colFieldMap.push({ col: c, field: 'annPA' });
+        else if (rawSub.includes('phys') && rawSub.includes('target')) colFieldMap.push({ col: c, field: 'annPT' });
+        else if (rawSub.includes('phys') && rawSub.includes('actual')) colFieldMap.push({ col: c, field: 'annPA' });
         else if (rawSub.includes('phys') && (rawSub.includes('%') || rawSub.includes('accomp'))) colFieldMap.push({ col: c, field: 'physPct' });
-        else if (rawSub.includes('annual') && rawSub.includes('fin') && rawSub.includes('target')) colFieldMap.push({ col: c, field: 'annFT' });
-        else if (rawSub.includes('annual') && rawSub.includes('fin') && rawSub.includes('actual')) colFieldMap.push({ col: c, field: 'annFA' });
+        else if (rawSub.includes('fin') && rawSub.includes('target')) colFieldMap.push({ col: c, field: 'annFT' });
+        else if (rawSub.includes('fin') && rawSub.includes('actual')) colFieldMap.push({ col: c, field: 'annFA' });
+        else if (rawSub.includes('expenditure') || rawSub.includes('utilized') || rawSub.includes('disbursement')) colFieldMap.push({ col: c, field: 'annFA' });
         else if (rawSub.includes('fin') && (rawSub.includes('%') || rawSub.includes('accomp'))) colFieldMap.push({ col: c, field: 'finPct' });
-        else if (rawSub.includes('remaining') || rawSub.includes('balance')) colFieldMap.push({ col: c, field: 'remaining' });
-        else if (rawSub.includes('util')) colFieldMap.push({ col: c, field: 'utilPct' });
+        else if (rawSub.includes('remaining') || rawSub.includes('balance') || rawSub.includes('unutilized')) colFieldMap.push({ col: c, field: 'remaining' });
+        else if (rawSub.includes('util') || rawSub.includes('share')) colFieldMap.push({ col: c, field: 'utilPct' });
         else if (rawSub.includes('status')) colFieldMap.push({ col: c, field: 'status' });
-        else if (rawSub.includes('remark')) colFieldMap.push({ col: c, field: 'remarks' });
+        else if (rawSub.includes('remark') || rawSub.includes('note')) colFieldMap.push({ col: c, field: 'remarks' });
       }
+
+      // Build unified numeric/text dataset matching reportType
+      const progById = new Map(fyPrograms.map((p) => [p.id, p]));
+      const gadSummary =
+        reportType === 'gad_compliance'
+          ? computeGadComplianceSummary(fyPrograms, computedList)
+          : null;
+
+      interface UnifiedExcelRow {
+        ref: string;
+        description: string;
+        program: string;
+        targetOutputs: string | number;
+        office: string;
+        sourceOfFund: string;
+        classification: string;
+        gf: number;
+        ps: number;
+        mooe: number;
+        co: number;
+        approved: number;
+        withheld: number;
+        supp1: number;
+        supp2: number;
+        supp3: number;
+        supp4: number;
+        supp5: number;
+        revised: number;
+        annPT: number;
+        annPA: number;
+        physPct: number;
+        annFT: number;
+        annFA: number;
+        finPct: number;
+        remaining: number;
+        utilPct: number;
+        status: string;
+        remarks: string;
+        monthly?: MonthlyMonitoringMap;
+      }
+
+      const unifiedRows: UnifiedExcelRow[] =
+        reportType === 'program_level'
+          ? fyPrograms.map((p) => {
+              const s = summarizeProgram(p, computedList);
+              return {
+                ref: p.aipRefCode,
+                description: p.title,
+                program: p.title,
+                targetOutputs: s.activityCount,
+                office: p.officeName,
+                sourceOfFund: p.sourceOfFund || '',
+                classification: p.sourceOfFund || '',
+                gf: s.gf,
+                ps: s.ps,
+                mooe: s.mooe,
+                co: s.co,
+                approved: s.approvedBudget,
+                withheld: s.withheldAmount,
+                supp1: s.totalSupplemental,
+                supp2: 0,
+                supp3: 0,
+                supp4: 0,
+                supp5: 0,
+                revised: s.revisedBudget,
+                annPT: s.annualPhysicalTarget,
+                annPA: s.annualPhysicalActual,
+                physPct: s.physicalAccomplishmentPct,
+                annFT: s.annualFinancialTarget,
+                annFA: s.annualFinancialActual,
+                finPct: s.financialAccomplishmentPct,
+                remaining: s.remainingBudget,
+                utilPct: s.budgetUtilizationPct,
+                status: s.budgetUtilizationPct >= 100 ? 'COMPLETED' : 'ON-GOING',
+                remarks: '',
+              };
+            })
+          : reportType === 'gad_compliance' && gadSummary
+            ? gadSummary.gadPrograms.map((s) => {
+                const share =
+                  gadSummary.totalBudgetApproved > 0
+                    ? round2((s.approvedBudget / gadSummary.totalBudgetApproved) * 100)
+                    : 0;
+                return {
+                  ref: s.program.aipRefCode,
+                  description: s.program.title,
+                  program: s.program.title,
+                  targetOutputs: s.activityCount,
+                  office: s.program.officeName,
+                  sourceOfFund: s.program.sourceOfFund || '',
+                  classification: s.program.sourceOfFund || '',
+                  gf: s.gf,
+                  ps: s.ps,
+                  mooe: s.mooe,
+                  co: s.co,
+                  approved: s.approvedBudget,
+                  withheld: s.withheldAmount,
+                  supp1: s.totalSupplemental,
+                  supp2: 0,
+                  supp3: 0,
+                  supp4: 0,
+                  supp5: 0,
+                  revised: s.revisedBudget,
+                  annPT: s.annualPhysicalTarget,
+                  annPA: s.annualPhysicalActual,
+                  physPct: s.physicalAccomplishmentPct,
+                  annFT: s.annualFinancialTarget,
+                  annFA: s.annualFinancialActual,
+                  finPct: s.financialAccomplishmentPct,
+                  remaining: s.remainingBudget,
+                  utilPct: share,
+                  status: s.budgetUtilizationPct >= 100 ? 'COMPLETED' : 'ON-GOING',
+                  remarks: '',
+                };
+              })
+            : computedList.map((act) => {
+                const prog = progById.get(act.programId);
+                return {
+                  ref: act.referenceNumber,
+                  description: act.description,
+                  program: prog?.title || '',
+                  targetOutputs: act.targetOutputs || '',
+                  office: act.officeName,
+                  sourceOfFund: act.sourceOfFund || prog?.sourceOfFund || '',
+                  classification: act.budgetClassification,
+                  gf: act.gf,
+                  ps: act.ps,
+                  mooe: act.mooe,
+                  co: act.co,
+                  approved: act.approvedBudget,
+                  withheld: act.withheldAmount,
+                  supp1: act.supplementalBudget1,
+                  supp2: act.supplementalBudget2,
+                  supp3: act.supplementalBudget3,
+                  supp4: act.supplementalBudget4,
+                  supp5: act.supplementalBudget5,
+                  revised: act.revisedBudget,
+                  annPT: act.annualPhysicalTarget,
+                  annPA: act.annualPhysicalActual,
+                  physPct: act.physicalAccomplishmentPct,
+                  annFT: act.annualFinancialTarget,
+                  annFA: act.annualFinancialActual,
+                  finPct: act.financialAccomplishmentPct,
+                  remaining: act.remainingBudget,
+                  utilPct: act.budgetUtilizationPct,
+                  status: act.status,
+                  remarks: act.remarks || '',
+                  monthly: act.monthly,
+                };
+              });
 
       // Detect blank data zone end (before TOTAL or Signatory rows like "Prepared by")
       const templateDataStartRow = headerRowIdx + 1;
@@ -409,188 +596,260 @@ export async function populateOfficialExcelTemplate(options: {
       }
 
       const styleTemplateRow = ws.getRow(templateDataStartRow);
-      const progById = new Map(fyPrograms.map((p) => [p.id, p]));
-      const neededRows = Math.max(1, computedList.length);
+      const neededRows = Math.max(1, unifiedRows.length);
 
-      // If we need more rows than blank slots before footer/signatories, splice blank rows down safely
+      // Safely splice blank rows while preserving & shifting merged cell ranges below insertion point
       if (existingDataSlots > 0 && neededRows > existingDataSlots) {
         const extraCount = neededRows - existingDataSlots;
         const insertAt = templateDataStartRow + existingDataSlots;
+        const shiftedMerges = shiftMergesBelowRow(ws, insertAt, extraCount);
         const emptyRowArrays = Array.from({ length: extraCount }, () => []);
         ws.spliceRows(insertAt, 0, ...emptyRowArrays);
+        for (const range of shiftedMerges) {
+          try {
+            ws.mergeCells(range);
+          } catch {
+            // ignore duplicate/overlapping merges
+          }
+        }
       }
 
-      computedList.forEach((act, idx) => {
-        const rowNum = templateDataStartRow + idx;
-        const targetRow = ws.getRow(rowNum);
-        const prog = progById.get(act.programId);
-
+      if (unifiedRows.length === 0) {
+        const targetRow = ws.getRow(templateDataStartRow);
         for (const mapping of colFieldMap) {
-          const srcCell = styleTemplateRow.getCell(mapping.col);
-          const destCell = targetRow.getCell(mapping.col);
-          if (rowNum !== templateDataStartRow) {
-            cloneCellStyle(srcCell, destCell);
-          }
-
-          let val: string | number = '';
-          let numFmt: string | undefined;
-          if (mapping.field === 'monthly' && mapping.monthKey && mapping.monthProp) {
-            const mEntry = act.monthly[mapping.monthKey];
-            if (mapping.monthProp === 'pt') {
-              val = mEntry.physicalTarget;
-              numFmt = '#,##0.##';
-            } else if (mapping.monthProp === 'ft') {
-              val = mEntry.financialTarget;
-              numFmt = '₱#,##0.00';
-            } else if (mapping.monthProp === 'pa') {
-              val = mEntry.physicalActual;
-              numFmt = '#,##0.##';
-            } else {
-              val = mEntry.financialActual;
-              numFmt = '₱#,##0.00';
-            }
-          } else {
-            switch (mapping.field) {
-              case 'ref':
-                val = escapeExcelExportText(act.referenceNumber);
-                break;
-              case 'description':
-                val = escapeExcelExportText(act.description);
-                break;
-              case 'program':
-                val = escapeExcelExportText(prog?.title || '');
-                break;
-              case 'targetOutputs':
-                val = escapeExcelExportText(act.targetOutputs || '');
-                break;
-              case 'office':
-                val = escapeExcelExportText(act.officeName);
-                break;
-              case 'sourceOfFund':
-                val = escapeExcelExportText(act.sourceOfFund || prog?.sourceOfFund || '');
-                break;
-              case 'classification':
-                val = escapeExcelExportText(act.budgetClassification);
-                break;
-              case 'gf':
-                val = act.gf;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'ps':
-                val = act.ps;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'mooe':
-                val = act.mooe;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'co':
-                val = act.co;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'approved':
-                val = act.approvedBudget;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'withheld':
-                val = act.withheldAmount;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'supp1':
-                val = act.supplementalBudget1;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'supp2':
-                val = act.supplementalBudget2;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'supp3':
-                val = act.supplementalBudget3;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'supp4':
-                val = act.supplementalBudget4;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'supp5':
-                val = act.supplementalBudget5;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'revised':
-                val = act.revisedBudget;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'annPT':
-                val = act.annualPhysicalTarget;
-                numFmt = '#,##0.##';
-                break;
-              case 'annPA':
-                val = act.annualPhysicalActual;
-                numFmt = '#,##0.##';
-                break;
-              case 'physPct':
-                val = act.physicalAccomplishmentPct / 100;
-                numFmt = '0.00%';
-                break;
-              case 'annFT':
-                val = act.annualFinancialTarget;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'annFA':
-                val = act.annualFinancialActual;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'finPct':
-                val = act.financialAccomplishmentPct / 100;
-                numFmt = '0.00%';
-                break;
-              case 'remaining':
-                val = act.remainingBudget;
-                numFmt = '₱#,##0.00';
-                break;
-              case 'utilPct':
-                val = act.budgetUtilizationPct / 100;
-                numFmt = '0.00%';
-                break;
-              case 'status':
-                val = escapeExcelExportText(act.status);
-                break;
-              case 'remarks':
-                val = escapeExcelExportText(act.remarks || '');
-                break;
-            }
-          }
-          destCell.value = val;
-          if (numFmt && !destCell.numFmt) destCell.numFmt = numFmt;
-          destCell.alignment = {
-            ...(destCell.alignment || {}),
-            wrapText: true,
-            vertical: 'top',
-          };
+          targetRow.getCell(mapping.col).value =
+            mapping.field === 'description'
+              ? 'No matching records for the selected filters.'
+              : '';
         }
-        targetRow.height = estimateWrappedRowHeight([
-          act.description,
-          act.targetOutputs,
-          act.remarks,
-        ]);
-      });
+      } else {
+        unifiedRows.forEach((rec, idx) => {
+          const rowNum = templateDataStartRow + idx;
+          const targetRow = ws.getRow(rowNum);
 
-      // Update TOTAL row if present directly after data rows
+          // Copy row styling across all table columns on newly added rows
+          if (rowNum !== templateDataStartRow) {
+            for (let c = 1; c <= totalCols; c++) {
+              cloneCellStyle(styleTemplateRow.getCell(c), targetRow.getCell(c));
+            }
+          }
+
+          for (const mapping of colFieldMap) {
+            const destCell = targetRow.getCell(mapping.col);
+
+            let val: string | number = '';
+            let numFmt: string | undefined;
+            if (mapping.field === 'monthly' && mapping.monthKey && mapping.monthProp && rec.monthly) {
+              const mEntry = rec.monthly[mapping.monthKey];
+              if (mapping.monthProp === 'pt') {
+                val = mEntry.physicalTarget;
+                numFmt = '#,##0.##';
+              } else if (mapping.monthProp === 'ft') {
+                val = mEntry.financialTarget;
+                numFmt = '₱#,##0.00';
+              } else if (mapping.monthProp === 'pa') {
+                val = mEntry.physicalActual;
+                numFmt = '#,##0.##';
+              } else {
+                val = mEntry.financialActual;
+                numFmt = '₱#,##0.00';
+              }
+            } else {
+              switch (mapping.field) {
+                case 'index':
+                  val = idx + 1;
+                  numFmt = '0';
+                  break;
+                case 'ref':
+                  val = escapeExcelExportText(rec.ref);
+                  break;
+                case 'description':
+                  val = escapeExcelExportText(rec.description);
+                  break;
+                case 'program':
+                  val = escapeExcelExportText(rec.program);
+                  break;
+                case 'targetOutputs':
+                  val =
+                    typeof rec.targetOutputs === 'number'
+                      ? rec.targetOutputs
+                      : escapeExcelExportText(rec.targetOutputs);
+                  break;
+                case 'office':
+                  val = escapeExcelExportText(rec.office);
+                  break;
+                case 'sourceOfFund':
+                  val = escapeExcelExportText(rec.sourceOfFund);
+                  break;
+                case 'classification':
+                  val = escapeExcelExportText(rec.classification);
+                  break;
+                case 'gf':
+                  val = rec.gf;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'ps':
+                  val = rec.ps;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'mooe':
+                  val = rec.mooe;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'co':
+                  val = rec.co;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'approved':
+                  val = rec.approved;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'withheld':
+                  val = rec.withheld;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'supp1':
+                  val = rec.supp1;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'supp2':
+                  val = rec.supp2;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'supp3':
+                  val = rec.supp3;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'supp4':
+                  val = rec.supp4;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'supp5':
+                  val = rec.supp5;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'revised':
+                  val = rec.revised;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'annPT':
+                  val = rec.annPT;
+                  numFmt = '#,##0.##';
+                  break;
+                case 'annPA':
+                  val = rec.annPA;
+                  numFmt = '#,##0.##';
+                  break;
+                case 'physPct':
+                  val = rec.physPct / 100;
+                  numFmt = '0.00%';
+                  break;
+                case 'annFT':
+                  val = rec.annFT;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'annFA':
+                  val = rec.annFA;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'finPct':
+                  val = rec.finPct / 100;
+                  numFmt = '0.00%';
+                  break;
+                case 'remaining':
+                  val = rec.remaining;
+                  numFmt = '₱#,##0.00';
+                  break;
+                case 'utilPct':
+                  val = rec.utilPct / 100;
+                  numFmt = '0.00%';
+                  break;
+                case 'status':
+                  val = escapeExcelExportText(rec.status);
+                  break;
+                case 'remarks':
+                  val = escapeExcelExportText(rec.remarks);
+                  break;
+              }
+            }
+            destCell.value = val;
+            if (numFmt && !destCell.numFmt) destCell.numFmt = numFmt;
+            destCell.alignment = {
+              ...(destCell.alignment || {}),
+              wrapText: true,
+              vertical: 'top',
+            };
+          }
+          targetRow.height = estimateWrappedRowHeight([
+            rec.description,
+            String(rec.targetOutputs || ''),
+            rec.remarks,
+          ]);
+        });
+      }
+
+      // Update TOTAL row if present directly after data rows (scan cols 1..5 for "TOTAL")
       const totalRowCandidate = ws.getRow(templateDataStartRow + neededRows);
-      const totalFirstCell = cellToString(totalRowCandidate.getCell(1).value).toUpperCase();
-      const totalSecondCell = cellToString(totalRowCandidate.getCell(2).value).toUpperCase();
-      if (totalFirstCell.includes('TOTAL') || totalSecondCell.includes('TOTAL')) {
+      let isTotalRow = false;
+      for (let c = 1; c <= Math.min(5, totalCols); c++) {
+        if (cellToString(totalRowCandidate.getCell(c).value).toUpperCase().includes('TOTAL')) {
+          isTotalRow = true;
+          break;
+        }
+      }
+      if (isTotalRow && unifiedRows.length > 0) {
         const endDataRow = templateDataStartRow + neededRows - 1;
+        const findCol = (field: string) => colFieldMap.find((m) => m.field === field)?.col;
         for (const mapping of colFieldMap) {
+          const destTotalCell = totalRowCandidate.getCell(mapping.col);
           if (
             ['gf', 'ps', 'mooe', 'co', 'approved', 'withheld', 'supp1', 'supp2', 'supp3', 'supp4', 'supp5', 'revised', 'annPT', 'annPA', 'annFT', 'annFA', 'remaining', 'monthly'].includes(
               mapping.field
             )
           ) {
             const cLet = colLetter(mapping.col);
-            totalRowCandidate.getCell(mapping.col).value = {
+            destTotalCell.value = {
               formula: `SUM(${cLet}${templateDataStartRow}:${cLet}${endDataRow})`,
             };
+            if (!destTotalCell.numFmt) {
+              destTotalCell.numFmt =
+                mapping.field === 'annPT' ||
+                mapping.field === 'annPA' ||
+                mapping.monthProp === 'pt' ||
+                mapping.monthProp === 'pa'
+                  ? '#,##0.##'
+                  : '₱#,##0.00';
+            }
+          } else if (mapping.field === 'physPct') {
+            const cPt = findCol('annPT');
+            const cPa = findCol('annPA');
+            if (cPt && cPa) {
+              const tRow = templateDataStartRow + neededRows;
+              destTotalCell.value = {
+                formula: `IF(${colLetter(cPt)}${tRow}=0,0,${colLetter(cPa)}${tRow}/${colLetter(cPt)}${tRow})`,
+              };
+              if (!destTotalCell.numFmt) destTotalCell.numFmt = '0.00%';
+            }
+          } else if (mapping.field === 'finPct') {
+            const cFt = findCol('annFT');
+            const cFa = findCol('annFA');
+            if (cFt && cFa) {
+              const tRow = templateDataStartRow + neededRows;
+              destTotalCell.value = {
+                formula: `IF(${colLetter(cFt)}${tRow}=0,0,${colLetter(cFa)}${tRow}/${colLetter(cFt)}${tRow})`,
+              };
+              if (!destTotalCell.numFmt) destTotalCell.numFmt = '0.00%';
+            }
+          } else if (mapping.field === 'utilPct') {
+            const cRev = findCol('revised');
+            const cFa = findCol('annFA');
+            if (cRev && cFa) {
+              const tRow = templateDataStartRow + neededRows;
+              destTotalCell.value = {
+                formula: `IF(${colLetter(cRev)}${tRow}=0,0,${colLetter(cFa)}${tRow}/${colLetter(cRev)}${tRow})`,
+              };
+              if (!destTotalCell.numFmt) destTotalCell.numFmt = '0.00%';
+            }
           }
         }
       }
@@ -612,6 +871,253 @@ export async function populateOfficialExcelTemplate(options: {
   });
 }
 
+function parseFormattedMetricForExcel(
+  raw: string,
+  isNumericCol = true
+): { value: string | number; numFmt?: string } {
+  const s = (raw || '').trim();
+  if (isNumericCol) {
+    if (s.startsWith('₱') || s.startsWith('-₱')) {
+      const num = Number(s.replace(/[₱,\s]/g, ''));
+      if (Number.isFinite(num)) return { value: num, numFmt: '₱#,##0.00' };
+    }
+    if (s.endsWith('%')) {
+      const num = Number(s.replace(/[%,\s]/g, ''));
+      if (Number.isFinite(num)) return { value: num / 100, numFmt: '0.00%' };
+    }
+    if (/^-?\d{1,3}(,\d{3})*(\.\d+)?$/.test(s) || /^-?\d+(\.\d+)?$/.test(s)) {
+      const num = Number(s.replace(/,/g, ''));
+      if (Number.isFinite(num)) return { value: num, numFmt: Number.isInteger(num) ? '#,##0' : '#,##0.##' };
+    }
+  }
+  return { value: escapeExcelExportText(s) };
+}
+
+async function addCanonicalReportWorksheet(options: {
+  wb: ExcelJS.Workbook;
+  reportType: ReportType;
+  fiscalYear: string;
+  monthKey: MonthKey;
+  municipalityName: string;
+  programs: Program[];
+  activities: ActivityComputed[];
+  settings?: SystemSettings;
+  paperSize: PaperSize;
+  orientation: PageOrientation;
+}) {
+  const {
+    wb,
+    reportType,
+    fiscalYear,
+    monthKey,
+    municipalityName,
+    programs,
+    activities,
+    settings,
+    paperSize,
+    orientation,
+  } = options;
+
+  const table = buildReportTableData({
+    reportType,
+    fiscalYear,
+    monthKey,
+    programs,
+    activities,
+  });
+
+  const safeSheetTitle = table.title.replace(/[\\/?*[\]:]/g, '').slice(0, 31) || 'Report';
+  const totalCols = table.headers.length;
+  const lastColLet = colLetter(totalCols);
+
+  const ws = wb.addWorksheet(safeSheetTitle, {
+    views: [{ state: 'frozen', ySplit: 6 }],
+    pageSetup: {
+      paperSize: excelPaperSizeCode(paperSize),
+      orientation,
+      fitToPage: true,
+      fitToWidth: 1,
+      fitToHeight: 0,
+      printTitlesRow: '6:6',
+      margins: { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.25, footer: 0.25 },
+    },
+  });
+
+  const logoBytes = await dataUrlToPngBytes(settings?.appLogoDataUrl);
+  if (logoBytes) {
+    try {
+      const b64 =
+        typeof Buffer !== 'undefined'
+          ? Buffer.from(logoBytes).toString('base64')
+          : btoa(String.fromCharCode(...logoBytes));
+      const imgId = wb.addImage({ base64: `data:image/png;base64,${b64}`, extension: 'png' });
+      ws.addImage(imgId, { tl: { col: 0.1, row: 0.1 }, ext: { width: 48, height: 48 } });
+    } catch {
+      // ignore image errors
+    }
+  }
+
+  const provinceUpper = (settings?.provinceName || 'Province of Camarines Sur').toUpperCase();
+  const officeTitle = settings?.officeTitle || 'Municipal Planning and Development Office (MPDO)';
+  const monthObj = MONTHS.find((m) => m.key === monthKey) || MONTHS[0];
+
+  ws.mergeCells(`A1:${lastColLet}1`);
+  ws.getCell('A1').value = `REPUBLIC OF THE PHILIPPINES · ${provinceUpper} · ${municipalityName.toUpperCase()}`;
+  ws.getCell('A1').font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF475569' } };
+  ws.getCell('A1').alignment = { horizontal: 'center', vertical: 'middle' };
+
+  ws.mergeCells(`A2:${lastColLet}2`);
+  ws.getCell('A2').value = table.title.toUpperCase();
+  ws.getCell('A2').font = { name: 'Calibri', size: 13, bold: true, color: { argb: 'FF0F294A' } };
+  ws.getCell('A2').alignment = { horizontal: 'center', vertical: 'middle' };
+
+  ws.mergeCells(`A3:${lastColLet}3`);
+  ws.getCell('A3').value = `${officeTitle} · ${formatFiscalYearDisplay(fiscalYear)}${
+    reportType === 'monthly_accomplishment' ? ` · Month: ${monthObj.label}` : ''
+  } · Generated: ${formatPhDate()}`;
+  ws.getCell('A3').font = { name: 'Calibri', size: 9.5, italic: true, color: { argb: 'FF475569' } };
+  ws.getCell('A3').alignment = { horizontal: 'center', vertical: 'middle' };
+
+  if (reportType === 'gad_compliance') {
+    const gad = computeGadComplianceSummary(programs, activities);
+    ws.mergeCells(`A4:${lastColLet}4`);
+    ws.getCell('A4').value = `GAD 5% Compliance: ${gad.isCompliant ? 'COMPLIANT' : 'BELOW 5.00% TARGET'} · Share: ${gad.gadShareApprovedPct.toFixed(2)}% · Mandatory 5% Floor: ₱${gad.mandatoryFivePctTarget.toLocaleString('en-PH', { minimumFractionDigits: 2 })}`;
+    ws.getCell('A4').font = {
+      name: 'Calibri',
+      size: 10,
+      bold: true,
+      color: { argb: gad.isCompliant ? 'FF15803D' : 'FFB45309' },
+    };
+    ws.getCell('A4').alignment = { horizontal: 'center', vertical: 'middle' };
+  }
+
+  const hdrRow = ws.getRow(6);
+  hdrRow.height = 24;
+  table.headers.forEach((h, idx) => {
+    const cell = hdrRow.getCell(idx + 1);
+    cell.value = h;
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F294A' } };
+    cell.font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
+    cell.alignment = {
+      horizontal: table.alignments[idx] || 'left',
+      vertical: 'middle',
+      wrapText: true,
+    };
+    cell.border = {
+      top: { style: 'thin', color: { argb: 'FF334155' } },
+      bottom: { style: 'thin', color: { argb: 'FF334155' } },
+      left: { style: 'thin', color: { argb: 'FF334155' } },
+      right: { style: 'thin', color: { argb: 'FF334155' } },
+    };
+  });
+
+  let curRow = 7;
+  const startDataRow = curRow;
+  if (table.rows.length === 0) {
+    ws.mergeCells(`A${curRow}:${lastColLet}${curRow}`);
+    const emptyCell = ws.getCell(`A${curRow}`);
+    emptyCell.value = table.emptyMessage || 'No matching records for this report.';
+    emptyCell.font = { name: 'Calibri', size: 10, italic: true, color: { argb: 'FF64748B' } };
+    emptyCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(curRow).height = 24;
+    curRow++;
+  } else {
+    table.rows.forEach((r, rowIdx) => {
+      const row = ws.getRow(curRow);
+      row.height = estimateWrappedRowHeight(r);
+      r.forEach((rawVal, colIdx) => {
+        const cell = row.getCell(colIdx + 1);
+        const parsed = parseFormattedMetricForExcel(rawVal, table.alignments[colIdx] === 'right');
+        cell.value = parsed.value;
+        if (parsed.numFmt) cell.numFmt = parsed.numFmt;
+        cell.font = { name: 'Calibri', size: 10, color: { argb: 'FF0F172A' } };
+        cell.alignment = {
+          horizontal: table.alignments[colIdx] || 'left',
+          vertical: 'top',
+          wrapText: true,
+        };
+        if (rowIdx % 2 === 1) {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
+        }
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+          bottom: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+          left: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+          right: { style: 'thin', color: { argb: 'FFE2E8F0' } },
+        };
+      });
+      curRow++;
+    });
+  }
+
+  const endDataRow = curRow - 1;
+  const footRow = ws.getRow(curRow);
+  footRow.height = 22;
+  table.foot.forEach((rawFoot, idx) => {
+    const cell = footRow.getCell(idx + 1);
+    const parsed = parseFormattedMetricForExcel(rawFoot, table.alignments[idx] === 'right');
+    const hdrLow = (table.headers[idx] || '').toLowerCase();
+    // Use live Excel SUM formulas for additive currency/quantity totals in TOTAL row when single-budget rows match
+    if (
+      table.rows.length > 0 &&
+      typeof parsed.value === 'number' &&
+      !hdrLow.includes('%') &&
+      !hdrLow.includes('share') &&
+      !hdrLow.includes('util') &&
+      parsed.numFmt !== '0.00%' &&
+      reportType !== 'annual_ppa' &&
+      reportType !== 'budget_utilization' &&
+      reportType !== 'financial_accomplishment'
+    ) {
+      const cLet = colLetter(idx + 1);
+      cell.value = { formula: `SUM(${cLet}${startDataRow}:${cLet}${endDataRow})`, result: parsed.value };
+    } else {
+      cell.value = parsed.value;
+    }
+    if (parsed.numFmt) cell.numFmt = parsed.numFmt;
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
+    cell.font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF0F294A' } };
+    cell.alignment = { horizontal: table.alignments[idx] || 'left', vertical: 'middle', wrapText: true };
+    cell.border = {
+      top: { style: 'medium', color: { argb: 'FF94A3B8' } },
+      bottom: { style: 'medium', color: { argb: 'FF94A3B8' } },
+      left: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+      right: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+    };
+  });
+  curRow++;
+
+  // Signatories
+  const sigStart = curRow + 2;
+  const sigPositions = [1, Math.max(2, Math.floor(totalCols / 3) + 1), Math.max(3, Math.floor((totalCols * 2) / 3) + 1)];
+  const sigData = [
+    { label: 'Prepared by:', name: settings?.preparedByName || '', title: settings?.preparedByTitle || '' },
+    { label: 'Reviewed by:', name: settings?.reviewedByName || '', title: settings?.reviewedByTitle || '' },
+    { label: 'Approved by:', name: settings?.approvedByName || '', title: settings?.approvedByTitle || '' },
+  ];
+  sigData.forEach((sig, i) => {
+    const col = sigPositions[i];
+    ws.getCell(sigStart, col).value = sig.label;
+    ws.getCell(sigStart, col).font = { name: 'Calibri', size: 10, color: { argb: 'FF475569' } };
+    ws.getCell(sigStart + 2, col).value = sig.name;
+    ws.getCell(sigStart + 2, col).font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF0F172A' } };
+    ws.getCell(sigStart + 3, col).value = sig.title;
+    ws.getCell(sigStart + 3, col).font = { name: 'Calibri', size: 9, color: { argb: 'FF475569' } };
+  });
+
+  // Column widths scaled proportionally to headers
+  table.headers.forEach((h, idx) => {
+    const low = h.toLowerCase();
+    let w = 17;
+    if (low.includes('description') || low.includes('ppa') || low.includes('program title') || low.includes('gad-attributed')) w = 38;
+    else if (low.includes('output') || low.includes('remark')) w = 26;
+    else if (low.includes('office') || low.includes('implementing') || low.includes('source')) w = 22;
+    else if (low.includes('ref') || low.includes('status')) w = 15;
+    else if (low === 'ppas' || low.includes('%') || low === 'gf' || low === 'ps' || low === 'mooe' || low === 'co') w = 14;
+    ws.getColumn(idx + 1).width = w;
+  });
+}
+
 export async function exportMonitoringWorkbook(options: {
   fiscalYear: string;
   municipalityName: string;
@@ -620,6 +1126,7 @@ export async function exportMonitoringWorkbook(options: {
   blankTemplate?: boolean;
   settings?: SystemSettings;
   reportType?: ReportType;
+  monthKey?: MonthKey;
   programFilterId?: string;
   statusFilter?: string;
   paperSize?: PaperSize;
@@ -634,6 +1141,7 @@ export async function exportMonitoringWorkbook(options: {
     blankTemplate,
     settings,
     reportType,
+    monthKey = 'jan',
     programFilterId = 'ALL',
     statusFilter = 'ALL',
     paperSize = 'a4',
@@ -645,6 +1153,7 @@ export async function exportMonitoringWorkbook(options: {
     return populateOfficialExcelTemplate({
       templateBuffer,
       fiscalYear,
+      monthKey,
       reportType: reportType || 'annual_ppa',
       programs: programs.filter((p) => programFilterId === 'ALL' || p.id === programFilterId),
       activities: activities.filter((a) => {
@@ -674,6 +1183,38 @@ export async function exportMonitoringWorkbook(options: {
   const wb = new ExcelJS.Workbook();
   wb.creator = settings?.appName || 'LGU Bula PPA Monitoring System (MPDO)';
   wb.created = new Date();
+
+  if (reportType && !blankTemplate) {
+    const filteredPrograms = programs.filter(
+      (p) =>
+        (fiscalYear === 'ALL' || p.fiscalYear === fiscalYear) &&
+        (programFilterId === 'ALL' || p.id === programFilterId)
+    );
+    const filteredComputed = filterActivitiesForReport(
+      reportType,
+      activities
+        .filter((a) => {
+          if (fiscalYear !== 'ALL' && a.fiscalYear !== fiscalYear) return false;
+          if (programFilterId !== 'ALL' && a.programId !== programFilterId) return false;
+          if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
+          return true;
+        })
+        .map(computeActivityMetrics)
+    );
+
+    await addCanonicalReportWorksheet({
+      wb,
+      reportType,
+      fiscalYear,
+      monthKey,
+      municipalityName,
+      programs: filteredPrograms,
+      activities: filteredComputed,
+      settings,
+      paperSize,
+      orientation,
+    });
+  }
 
   const fyLabel = formatFiscalYearDisplay(fiscalYear);
   const sheetTitle =
@@ -1222,10 +1763,11 @@ export async function parseMonitoringWorkbook(
   await wb.xlsx.load(buffer);
 
   const sheetNames = wb.worksheets.map((s) => s.name);
+  const preferredSheet = sheetNames.find((n) => n.toLowerCase().startsWith('ppa monitoring'));
   const selectedSheet =
     targetSheetName && sheetNames.includes(targetSheetName)
       ? targetSheetName
-      : sheetNames[0] || 'Sheet1';
+      : preferredSheet || sheetNames[0] || 'Sheet1';
 
   const ws = wb.getWorksheet(selectedSheet);
   if (!ws) {
@@ -1244,26 +1786,53 @@ export async function parseMonitoringWorkbook(
 
   let headerRowIdx = 1;
   let bestScore = -1;
-  const maxScan = Math.min(ws.rowCount, 20);
+  const maxScan = Math.min(ws.rowCount, 40);
   for (let r = 1; r <= maxScan; r++) {
     const row = ws.getRow(r);
     let score = 0;
+    let distinctCols = 0;
+    let wideMergedCount = 0;
     row.eachCell((cell) => {
+      if (cell.isMerged && cell.master !== cell) {
+        wideMergedCount++;
+        return;
+      }
       const txt = cellToString(cell.value).toLowerCase();
       if (!txt) return;
-      if (txt.includes('description') || txt.includes('ppa') || txt.includes('activity')) score += 3;
+      distinctCols++;
+      if (
+        txt.includes('description') ||
+        txt === 'ppa' ||
+        txt.includes('project/activity') ||
+        txt.includes('project / activity') ||
+        txt.includes('ppa title') ||
+        txt.includes('activity title') ||
+        txt.includes('program title') ||
+        txt.includes('particulars')
+      ) {
+        score += 4;
+      } else if (txt.includes('ppa') || txt.includes('activity')) {
+        score += 2;
+      }
       if (txt.includes('ref') || txt.includes('aip')) score += 2;
       if (txt.includes('target output') || txt.includes('output')) score += 2;
+      if (txt.includes('office') || txt.includes('implementing') || txt.includes('unit')) score += 2;
       if (txt === 'gf' || txt.includes('general fund')) score += 2;
       if (txt === 'ps' || txt.includes('personal service')) score += 2;
       if (txt === 'mooe' || txt.includes('maintenance')) score += 2;
       if (txt === 'co' || txt.includes('capital outlay')) score += 2;
+      if (txt.includes('approved') || txt.includes('revised') || txt.includes('budget')) score += 1;
       if (txt.includes('status') || txt.includes('remarks')) score += 1;
       if (txt.includes('physical target') || txt.includes('financial target')) score += 2;
     });
-    if (score > bestScore) {
-      bestScore = score;
-      headerRowIdx = r;
+    // Single-cell wide merged title banners (e.g. Row 2 "PPA MONITORING REPORT") have distinctCols === 1
+    if (distinctCols < 2) continue;
+    // Penalize group super-header rows where most columns are merged category spans (e.g. Row 5)
+    if (distinctCols >= 3 || (bestScore < 0 && wideMergedCount === 0)) {
+      if (score > bestScore) {
+        bestScore = score;
+        headerRowIdx = r;
+      }
     }
   }
 
@@ -1288,7 +1857,7 @@ export async function parseMonitoringWorkbook(
 
   const superRow = headerRowIdx > 1 ? ws.getRow(headerRowIdx - 1) : null;
   const hdrRow = ws.getRow(headerRowIdx);
-  const colCount = Math.max(hdrRow.cellCount, superRow?.cellCount ?? 0);
+  const colCount = Math.max(hdrRow.cellCount, superRow?.cellCount ?? 0, ws.columnCount || 0);
 
   let lastSuperMonth: MonthKey | null = null;
 
@@ -1316,10 +1885,20 @@ export async function parseMonitoringWorkbook(
       colMap.ref = c;
     } else if (
       colMap.description === undefined &&
-      (rawSub.includes('description') || rawSub === 'ppa' || rawSub.includes('project/activity'))
+      (rawSub.includes('description') ||
+        rawSub === 'ppa' ||
+        rawSub.includes('project/activity') ||
+        rawSub.includes('project / activity') ||
+        rawSub.includes('ppa title') ||
+        rawSub.includes('activity title') ||
+        rawSub.includes('particulars') ||
+        rawSub.includes('name of project'))
     ) {
       colMap.description = c;
-    } else if (colMap.program === undefined && rawSub === 'program') {
+    } else if (
+      colMap.program === undefined &&
+      (rawSub === 'program' || rawSub.includes('program title') || rawSub.includes('parent program'))
+    ) {
       colMap.program = c;
     } else if (colMap.targetOutputs === undefined && rawSub.includes('output')) {
       colMap.targetOutputs = c;
@@ -1338,6 +1917,13 @@ export async function parseMonitoringWorkbook(
       colMap.mooe = c;
     } else if (colMap.co === undefined && (rawSub === 'co' || rawSub.includes('capital outlay'))) {
       colMap.co = c;
+    } else if (
+      colMap.approved === undefined &&
+      ((rawSub.includes('approved') && rawSub.includes('budget')) ||
+        rawSub === 'approved' ||
+        rawSub.includes('appropriation'))
+    ) {
+      colMap.approved = c;
     } else if (colMap.withheld === undefined && rawSub.includes('withheld')) {
       colMap.withheld = c;
     } else if (colMap.supp1 === undefined && rawSub.includes('supplemental') && rawSub.includes('1')) {
@@ -1384,6 +1970,11 @@ export async function parseMonitoringWorkbook(
     }
   }
 
+  if (colMap.description === undefined && colMap.program !== undefined) {
+    colMap.description = colMap.program;
+    delete colMap.program;
+  }
+
   const existingByRef = new Map<string, Activity>();
   const existingByDesc = new Map<string, Activity>();
   for (const a of existingActivities) {
@@ -1428,10 +2019,20 @@ export async function parseMonitoringWorkbook(
     const upperRef = refVal.toUpperCase();
     const upperDesc = descVal.toUpperCase();
     if (
-      upperRef === 'TOTAL' ||
       upperRef.startsWith('PREPARED BY') ||
       upperRef.startsWith('REVIEWED BY') ||
       upperRef.startsWith('APPROVED BY') ||
+      upperRef.startsWith('CERTIFIED') ||
+      upperRef.startsWith('NOTED BY') ||
+      upperDesc.startsWith('PREPARED BY') ||
+      upperDesc.startsWith('REVIEWED BY') ||
+      upperDesc.startsWith('APPROVED BY')
+    ) {
+      break;
+    }
+    if (
+      upperRef === 'TOTAL' ||
+      upperRef === 'GRAND TOTAL' ||
       upperDesc.startsWith('GRAND TOTAL') ||
       upperDesc === 'TOTAL'
     ) {
@@ -1444,25 +2045,72 @@ export async function parseMonitoringWorkbook(
       ? cellToNumber(row.getCell(colMap.mooe).value)
       : { value: 0, invalid: false };
     const coCheck = colMap.co ? cellToNumber(row.getCell(colMap.co).value) : { value: 0, invalid: false };
+    const approvedCheck = colMap.approved
+      ? cellToNumber(row.getCell(colMap.approved).value)
+      : { value: 0, invalid: false };
+
+    const rawStatus = colMap.status ? cellToString(row.getCell(colMap.status).value) : '';
+    const rawRemarks = colMap.remarks ? cellToString(row.getCell(colMap.remarks).value) : '';
+    const rawClass = colMap.classification
+      ? cellToString(row.getCell(colMap.classification).value)
+      : '';
+
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    const monthly = createEmptyMonthlyData();
+    let hasAnyMonthlyData = false;
+    for (const m of MONTHS) {
+      const cols = monthCols[m.key];
+      if (cols.pt) {
+        const res = cellToNumber(row.getCell(cols.pt).value);
+        if (res.invalid) errors.push(`Invalid ${m.short} Physical Target.`);
+        monthly[m.key].physicalTarget = res.value;
+        if (res.value > 0) hasAnyMonthlyData = true;
+      }
+      if (cols.ft) {
+        const res = cellToNumber(row.getCell(cols.ft).value);
+        if (res.invalid) errors.push(`Invalid ${m.short} Financial Target.`);
+        monthly[m.key].financialTarget = round2(res.value);
+        if (res.value > 0) hasAnyMonthlyData = true;
+      }
+      if (cols.pa) {
+        const res = cellToNumber(row.getCell(cols.pa).value);
+        if (res.invalid) errors.push(`Invalid ${m.short} Physical Actual.`);
+        monthly[m.key].physicalActual = res.value;
+        if (res.value > 0) hasAnyMonthlyData = true;
+      }
+      if (cols.fa) {
+        const res = cellToNumber(row.getCell(cols.fa).value);
+        if (res.invalid) errors.push(`Invalid ${m.short} Financial Actual.`);
+        monthly[m.key].financialActual = round2(res.value);
+        if (res.value > 0) hasAnyMonthlyData = true;
+      }
+    }
+
+    const rowFillArgb =
+      (row.getCell(colMap.description || colMap.ref || 1).fill as { fgColor?: { argb?: string } } | undefined)
+        ?.fgColor?.argb || '';
+    const isShadedProgramBand = rowFillArgb === 'FFE2E8F0' || rowFillArgb === 'FFCBD5E1';
+
+    const hasBudgetSplit =
+      gfCheck.value > 0 || psCheck.value > 0 || mooeCheck.value > 0 || coCheck.value > 0;
 
     const isProgramHeader =
       !outputsVal &&
-      !progColVal &&
-      gfCheck.value === 0 &&
-      psCheck.value === 0 &&
-      mooeCheck.value === 0 &&
-      coCheck.value === 0 &&
+      !rawClass &&
+      !rawStatus &&
+      !rawRemarks &&
+      !hasBudgetSplit &&
+      !hasAnyMonthlyData &&
       descVal.length > 0 &&
-      (!colMap.status || !cellToString(row.getCell(colMap.status).value));
+      (isShadedProgramBand || (!progColVal && approvedCheck.value === 0));
 
     if (isProgramHeader) {
       currentProgramTitle = descVal;
       currentProgramRef = refVal || currentProgramRef;
       continue;
     }
-
-    const errors: string[] = [];
-    const warnings: string[] = [];
 
     if (!descVal) {
       errors.push('Missing Program/Project/Activity Description.');
@@ -1473,6 +2121,18 @@ export async function parseMonitoringWorkbook(
     }
     if (gfCheck.value < 0 || psCheck.value < 0 || mooeCheck.value < 0 || coCheck.value < 0) {
       errors.push('GF, PS, MOOE, and CO values cannot be negative.');
+    }
+
+    let gfVal = round2(gfCheck.value);
+    let psVal = round2(psCheck.value);
+    let mooeVal = round2(mooeCheck.value);
+    let coVal = round2(coCheck.value);
+    if (!hasBudgetSplit && approvedCheck.value > 0) {
+      const upperClass = rawClass.toUpperCase();
+      if (upperClass === 'PS') psVal = round2(approvedCheck.value);
+      else if (upperClass === 'CO') coVal = round2(approvedCheck.value);
+      else if (upperClass === 'GF') gfVal = round2(approvedCheck.value);
+      else mooeVal = round2(approvedCheck.value);
     }
 
     const withheldCheck = colMap.withheld
@@ -1488,39 +2148,9 @@ export async function parseMonitoringWorkbook(
       errors.push('Invalid numeric value in Withheld Amount.');
     }
 
-    const monthly = createEmptyMonthlyData();
-    for (const m of MONTHS) {
-      const cols = monthCols[m.key];
-      if (cols.pt) {
-        const res = cellToNumber(row.getCell(cols.pt).value);
-        if (res.invalid) errors.push(`Invalid ${m.short} Physical Target.`);
-        monthly[m.key].physicalTarget = res.value;
-      }
-      if (cols.ft) {
-        const res = cellToNumber(row.getCell(cols.ft).value);
-        if (res.invalid) errors.push(`Invalid ${m.short} Financial Target.`);
-        monthly[m.key].financialTarget = round2(res.value);
-      }
-      if (cols.pa) {
-        const res = cellToNumber(row.getCell(cols.pa).value);
-        if (res.invalid) errors.push(`Invalid ${m.short} Physical Actual.`);
-        monthly[m.key].physicalActual = res.value;
-      }
-      if (cols.fa) {
-        const res = cellToNumber(row.getCell(cols.fa).value);
-        if (res.invalid) errors.push(`Invalid ${m.short} Financial Actual.`);
-        monthly[m.key].financialActual = round2(res.value);
-      }
-    }
-
-    const rawStatus = colMap.status ? cellToString(row.getCell(colMap.status).value) : '';
     const status = normalizeStatus(rawStatus);
-    const rawRemarks = colMap.remarks ? cellToString(row.getCell(colMap.remarks).value) : '';
     const remarksSan = sanitizeSpreadsheetInputText(rawRemarks);
     const remarks = remarksSan.text;
-    const rawClass = colMap.classification
-      ? cellToString(row.getCell(colMap.classification).value)
-      : '';
 
     if (
       refSan.neutralized ||
@@ -1552,17 +2182,11 @@ export async function parseMonitoringWorkbook(
       description: descVal,
       targetOutputs: outputsVal,
       officeName: officeVal || 'Municipal Planning and Development Office',
-      budgetClassification: inferBudgetClass(
-        gfCheck.value,
-        psCheck.value,
-        mooeCheck.value,
-        coCheck.value,
-        rawClass
-      ),
-      gf: round2(gfCheck.value),
-      ps: round2(psCheck.value),
-      mooe: round2(mooeCheck.value),
-      co: round2(coCheck.value),
+      budgetClassification: inferBudgetClass(gfVal, psVal, mooeVal, coVal, rawClass),
+      gf: gfVal,
+      ps: psVal,
+      mooe: mooeVal,
+      co: coVal,
       withheldAmount: round2(withheldCheck.value),
       supplementalBudget1: round2(s1),
       supplementalBudget2: round2(s2),

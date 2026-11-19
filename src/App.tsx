@@ -73,7 +73,7 @@ import { ProgramsActivitiesModule } from './components/modules/ProgramsActivitie
 import { BudgetManagementModule } from './components/modules/BudgetManagementModule';
 import { AccomplishmentStatusModule } from './components/modules/AccomplishmentStatusModule';
 import { MonitoringEvaluationModule } from './components/modules/MonitoringEvaluationModule';
-import { ReportsModule } from './components/modules/ReportsModule';
+import { ReportsModule, ReportExcelExportOptions } from './components/modules/ReportsModule';
 import { ExcelImportExportModule } from './components/modules/ExcelImportExportModule';
 import { UserManagementModule } from './components/modules/UserManagementModule';
 import { SystemSettingsModule } from './components/modules/SystemSettingsModule';
@@ -1055,19 +1055,57 @@ export default function App() {
     setDb(res.db);
   };
 
-  const handleDownloadTemplate = async (blank = true, fy = selectedFiscalYear) => {
+  const handleDownloadTemplate = async (
+    blank = true,
+    fy = selectedFiscalYear,
+    extraOptions?: ReportExcelExportOptions
+  ) => {
     try {
-      const targetFy = fy === 'ALL' ? '2026' : fy;
+      const targetFy = blank
+        ? fy === 'ALL'
+          ? db.settings.defaultFiscalYear || '2026'
+          : fy
+        : fy;
+
+      let templateBuffer = extraOptions?.templateBuffer;
+      if (templateBuffer === undefined && !extraOptions?.reportType) {
+        try {
+          const tplRes = await dataService.listTemplates();
+          const defXlsx = (tplRes.templates || []).find(
+            (t) =>
+              t.isActive &&
+              t.isDefault &&
+              t.format === 'xlsx' &&
+              (t.targetReport === 'excel_monitoring' || t.targetReport === 'all_reports')
+          );
+          if (defXlsx) {
+            templateBuffer = await dataService.fetchTemplateBinary(defXlsx.id);
+          }
+        } catch {
+          /* Ignore offline template lookup failures */
+        }
+      }
+
       const blob = await exportMonitoringWorkbook({
         fiscalYear: targetFy,
         municipalityName: db.settings.municipalityName,
         programs: scopedPrograms,
         activities: scopedRawActivities,
         blankTemplate: blank,
+        settings: db.settings,
+        reportType: extraOptions?.reportType,
+        monthKey: extraOptions?.monthKey,
+        programFilterId: extraOptions?.programFilterId,
+        statusFilter: extraOptions?.statusFilter,
+        paperSize: extraOptions?.paperSize,
+        orientation: extraOptions?.orientation,
+        templateBuffer,
       });
       const fileName = blank
         ? `Monitoring_Template_Blank_FY${targetFy}.xlsx`
-        : `LGU_Bula_Monitoring_Template_FY${targetFy}.xlsx`;
+        : extraOptions?.reportType
+          ? `LGU_Bula_${extraOptions.reportType}_FY${targetFy}.xlsx`
+          : `LGU_Bula_Monitoring_Template_FY${targetFy}.xlsx`;
       triggerBlobDownload(blob, fileName);
       if (currentUser) {
         const log = buildAuditLog(
@@ -2093,7 +2131,7 @@ export default function App() {
               fiscalYears={db.fiscalYears}
               settings={db.settings}
               selectedFiscalYear={selectedFiscalYear}
-              onExportExcel={(fy) => handleDownloadTemplate(false, fy)}
+              onExportExcel={(fy, options) => handleDownloadTemplate(false, fy, options)}
               onLogReportExport={async (title, format) => {
                 const log = buildAuditLog(
                   currentUser,
@@ -2119,6 +2157,7 @@ export default function App() {
               uploadedDocuments={db.uploadedDocuments}
               selectedFiscalYear={selectedFiscalYear}
               municipalityName={db.settings.municipalityName}
+              settings={db.settings}
               currentUser={currentUser}
               onCommitImport={handleCommitExcelImport}
               onLogExport={async (fileName) => {

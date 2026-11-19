@@ -30,11 +30,13 @@ import {
 import {
   MONTHS,
   computeDashboardSummary,
+  computeGadComplianceSummary,
   formatPHP,
   formatPct,
 } from './calculations';
 import {
   TemplateContextRow,
+  TemplatePlaceholderContext,
   buildReportTableData,
   buildTemplatePlaceholderContext,
   dataUrlToPngBytes,
@@ -79,7 +81,8 @@ function stripXmlTags(xml: string): string {
 
 function mapHeaderToRowField(
   headerText: string,
-  row: TemplateContextRow
+  row: TemplateContextRow,
+  reportType?: ReportType
 ): string | null {
   const h = headerText.toLowerCase().trim();
   if (!h) return null;
@@ -88,10 +91,10 @@ function mapHeaderToRowField(
   if (h.includes('program') && !h.includes('description') && !h.includes('ppa')) {
     return row.programTitle || row.description;
   }
-  if (h.includes('description') || h.includes('activity') || h === 'ppa' || h.includes('project')) {
+  if (h.includes('description') || h.includes('activity') || h === 'ppa' || h.includes('project') || h.includes('gad-attributed')) {
     return row.description;
   }
-  if (h.includes('output')) return row.targetOutputs;
+  if (h === 'ppas' || h.includes('output')) return row.targetOutputs;
   if (h.includes('office') || h.includes('implementing') || h.includes('unit')) return row.officeName;
   if (h.includes('source') || h.includes('fund')) return row.sourceOfFund;
   if (h === 'gf' || h.includes('general fund')) return row.gf;
@@ -106,19 +109,63 @@ function mapHeaderToRowField(
   if (h.includes('remaining') || h.includes('balance') || h.includes('unutilized')) {
     return row.remainingBudget;
   }
-  if (h.includes('phys') && h.includes('target')) return row.physicalTarget;
-  if (h.includes('phys') && h.includes('actual')) return row.physicalActual;
+  if (h.includes('phys') && h.includes('target')) {
+    return reportType === 'monthly_accomplishment' && row.monthPhysicalTarget !== ''
+      ? row.monthPhysicalTarget
+      : row.physicalTarget;
+  }
+  if (h.includes('phys') && h.includes('actual')) {
+    return reportType === 'monthly_accomplishment' && row.monthPhysicalActual !== ''
+      ? row.monthPhysicalActual
+      : row.physicalActual;
+  }
   if (h.includes('phys') && (h.includes('%') || h.includes('rate') || h.includes('accomp'))) {
     return row.physicalPct;
   }
-  if (h.includes('fin') && h.includes('target')) return row.financialTarget;
-  if (h.includes('fin') && h.includes('actual')) return row.financialActual;
+  if (h.includes('fin') && h.includes('target')) {
+    return reportType === 'monthly_accomplishment' && row.monthFinancialTarget !== ''
+      ? row.monthFinancialTarget
+      : row.financialTarget;
+  }
+  if (h.includes('fin') && h.includes('actual')) {
+    return reportType === 'monthly_accomplishment' && row.monthFinancialActual !== ''
+      ? row.monthFinancialActual
+      : row.financialActual;
+  }
   if (h.includes('fin') && (h.includes('%') || h.includes('rate') || h.includes('accomp'))) {
     return row.financialPct;
   }
-  if (h.includes('util')) return row.utilizationPct;
+  if (h.includes('util') || h.includes('share')) return row.utilizationPct;
   if (h.includes('status')) return row.status;
   if (h.includes('remark') || h.includes('note')) return row.remarks;
+  return null;
+}
+
+function mapHeaderToTotalField(
+  headerText: string,
+  ctx: TemplatePlaceholderContext
+): string | null {
+  const h = headerText.toLowerCase().trim();
+  if (!h) return null;
+  if (h === 'gf' || h.includes('general fund')) return ctx.totalGF;
+  if (h === 'ps' || h.includes('personal service')) return ctx.totalPS;
+  if (h === 'mooe' || h.includes('maintenance')) return ctx.totalMOOE;
+  if (h === 'co' || h.includes('capital')) return ctx.totalCO;
+  if (h.includes('approved')) return ctx.totalApprovedBudget;
+  if (h.includes('revised')) return ctx.totalRevisedBudget;
+  if (h.includes('expenditure') || h.includes('utilized') || h.includes('disbursement')) {
+    return ctx.totalExpenditure;
+  }
+  if (h.includes('remaining') || h.includes('balance') || h.includes('unutilized')) {
+    return ctx.remainingBudget;
+  }
+  if (h.includes('phys') && (h.includes('%') || h.includes('rate') || h.includes('accomp'))) {
+    return ctx.overallPhysicalPct;
+  }
+  if (h.includes('fin') && (h.includes('%') || h.includes('rate') || h.includes('accomp'))) {
+    return ctx.overallFinancialPct;
+  }
+  if (h.includes('util')) return ctx.budgetUtilizationPct;
   return null;
 }
 
@@ -209,24 +256,34 @@ export async function populateOfficialDocxTemplate(options: {
     });
     doc.render(ctx);
   } catch {
-    // If docxtemplater encounters malformed partial tags inside raw official Word XML, fall back safely to string token replacement
+    // If docxtemplater encounters split XML runs inside raw official Word XML, normalize simple split tokens safely
     const xmlFiles = Object.keys(zip.files).filter(
       (name) =>
         name === 'word/document.xml' ||
         /^word\/header\d*\.xml$/.test(name) ||
         /^word\/footer\d*\.xml$/.test(name)
     );
+    const flatTokenMap = new Map<string, string>();
+    for (const [k, v] of Object.entries(ctx)) {
+      if (typeof v === 'string' || typeof v === 'number') {
+        flatTokenMap.set(k, xmlEscape(String(v)));
+      }
+    }
     for (const fName of xmlFiles) {
       let xml = zip.file(fName)?.asText();
       if (!xml) continue;
-      for (const [k, v] of Object.entries(ctx)) {
-        if (typeof v === 'string' || typeof v === 'number') {
-          const safeVal = xmlEscape(String(v));
-          xml = xml
-            .replace(new RegExp(`\\{\\{\\s*${k}\\s*\\}\\}`, 'g'), safeVal)
-            .replace(new RegExp(`\\{\\s*${k}\\s*\\}`, 'g'), safeVal);
+      // Handle both contiguous {{key}} and split-run {{<tags>key<tags>}}
+      xml = xml.replace(
+        /\{\{((?:(?!\}\}).){1,240}?)\}\}|\{((?:(?!\}).){1,120}?)\}/g,
+        (fullMatch, g1, g2) => {
+          const innerRaw = String(g1 ?? g2 ?? '');
+          const cleanKey = innerRaw.replace(/<[^>]+>/g, '').trim();
+          if (flatTokenMap.has(cleanKey)) {
+            return flatTokenMap.get(cleanKey)!;
+          }
+          return fullMatch;
         }
-      }
+      );
       zip.file(fName, xml);
     }
   }
@@ -261,7 +318,8 @@ export async function populateOfficialDocxTemplate(options: {
       // Verify at least 2 column headers map to PPA data fields
       const mappedCount =
         ctx.records.length > 0
-          ? headerTexts.filter((h) => mapHeaderToRowField(h, ctx.records[0]) !== null).length
+          ? headerTexts.filter((h) => mapHeaderToRowField(h, ctx.records[0], reportType) !== null)
+              .length
           : headerTexts.filter((h) => {
               const low = h.toLowerCase();
               return (
@@ -278,6 +336,8 @@ export async function populateOfficialDocxTemplate(options: {
       // Identify template data row (row 1) and check if last row is a TOTAL row
       const templateRowXml = rows[1];
       const templateCells = templateRowXml.match(/<w:tc\b[\s\S]*?<\/w:tc>/g) || [];
+      const trPrMatch = /<w:trPr\b[\s\S]*?<\/w:trPr>/.exec(templateRowXml);
+      const trPr = trPrMatch ? trPrMatch[0] : '';
       const lastRowXml = rows[rows.length - 1];
       const lastRowText = stripXmlTags(lastRowXml).toLowerCase();
       const hasTotalFooter = rows.length >= 3 && lastRowText.includes('total');
@@ -285,24 +345,44 @@ export async function populateOfficialDocxTemplate(options: {
       const populatedRowsXml = ctx.records.map((rec) => {
         const clonedCells = templateCells.map((cellXml, colIdx) => {
           const headerName = headerTexts[colIdx] || '';
-          const mapped = mapHeaderToRowField(headerName, rec);
-          if (mapped === null) return setCellTextPreservingStyle(cellXml, '');
-          return setCellTextPreservingStyle(cellXml, mapped);
+          const mapped = mapHeaderToRowField(headerName, rec, reportType);
+          return setCellTextPreservingStyle(cellXml, mapped ?? '');
         });
-        return templateRowXml.replace(
-          /<w:tc\b[\s\S]*?<\/w:tc>(?=[\s\S]*<\/w:tr>)/,
-          () => '__CELLS_PLACEHOLDER__'
-        ) && (() => {
-          // Rebuild <w:tr> keeping <w:trPr>
-          const trPrMatch = /<w:trPr\b[\s\S]*?<\/w:trPr>/.exec(templateRowXml);
-          return `<w:tr>${trPrMatch ? trPrMatch[0] : ''}${clonedCells.join('')}</w:tr>`;
-        })();
+        return `<w:tr>${trPr}${clonedCells.join('')}</w:tr>`;
       });
+
+      const emptyFallbackRowXml = `<w:tr>${trPr}${templateCells
+        .map((cellXml, colIdx) =>
+          setCellTextPreservingStyle(
+            cellXml,
+            colIdx === 1 || (templateCells.length <= 2 && colIdx === 0)
+              ? 'No matching records for the selected filters.'
+              : ''
+          )
+        )
+        .join('')}</w:tr>`;
+
+      let populatedFooterXml = lastRowXml;
+      if (hasTotalFooter) {
+        const footerCells = lastRowXml.match(/<w:tc\b[\s\S]*?<\/w:tc>/g) || [];
+        const footerTrPrMatch = /<w:trPr\b[\s\S]*?<\/w:trPr>/.exec(lastRowXml);
+        const updatedFooterCells = footerCells.map((cellXml, colIdx) => {
+          const currentTxt = stripXmlTags(cellXml);
+          if (currentTxt.toLowerCase().includes('total')) return cellXml;
+          const headerName = headerTexts[colIdx] || '';
+          const totalVal = mapHeaderToTotalField(headerName, ctx);
+          if (totalVal !== null) {
+            return setCellTextPreservingStyle(cellXml, totalVal);
+          }
+          return cellXml;
+        });
+        populatedFooterXml = `<w:tr>${footerTrPrMatch ? footerTrPrMatch[0] : ''}${updatedFooterCells.join('')}</w:tr>`;
+      }
 
       const rebuiltRows = [
         headerRowXml,
-        ...(populatedRowsXml.length > 0 ? populatedRowsXml : [templateRowXml]),
-        ...(hasTotalFooter ? [lastRowXml] : []),
+        ...(populatedRowsXml.length > 0 ? populatedRowsXml : [emptyFallbackRowXml]),
+        ...(hasTotalFooter ? [populatedFooterXml] : []),
       ];
 
       tablePopulated = true;
@@ -582,8 +662,26 @@ export async function generateStandardDocxReport(options: {
           }),
         ];
 
+  const usableTwips = Math.max(8000, pageSizeConfig.width - 1440);
+  const colWeights = table.headers.map((h) => {
+    const low = h.toLowerCase();
+    if (low.includes('description') || low.includes('ppa') || low.includes('program title') || low.includes('gad-attributed')) {
+      return 3.0;
+    }
+    if (low.includes('output') || low.includes('remark')) return 2.2;
+    if (low.includes('office') || low.includes('implementing') || low.includes('source')) return 1.8;
+    if (low.includes('ref') || low.includes('status')) return 1.25;
+    if (low === 'ppas' || low.includes('%') || low === 'gf' || low === 'ps' || low === 'mooe' || low === 'co') {
+      return 1.05;
+    }
+    return 1.45;
+  });
+  const totalColWeight = colWeights.reduce((a, b) => a + b, 0) || 1;
+  const columnWidths = colWeights.map((w) => Math.round((w / totalColWeight) * usableTwips));
+
   const mainTable = new Table({
     width: { size: 100, type: WidthType.PERCENTAGE },
+    columnWidths,
     rows: [
       new TableRow({
         tableHeader: true,
@@ -721,6 +819,73 @@ export async function generateStandardDocxReport(options: {
         children: [
           ...headerChildren,
           kpiTable,
+          ...(reportType === 'gad_compliance'
+            ? (() => {
+                const gad = computeGadComplianceSummary(programs, filteredActivities);
+                return [
+                  new Paragraph({ spacing: { before: 80, after: 40 }, children: [] }),
+                  new Table({
+                    width: { size: 100, type: WidthType.PERCENTAGE },
+                    rows: [
+                      new TableRow({
+                        cantSplit: true,
+                        children: [
+                          'LGU Approved Budget',
+                          'Mandatory 5% Target',
+                          'GAD Attribution',
+                          'GAD Share %',
+                          '5% Variance',
+                          'Statutory Compliance',
+                        ].map(
+                          (h) =>
+                            new TableCell({
+                              borders: cellBorders,
+                              shading: { fill: '0D9488', type: ShadingType.CLEAR, color: 'auto' },
+                              children: [
+                                new Paragraph({
+                                  alignment: AlignmentType.CENTER,
+                                  children: [
+                                    new TextRun({ text: h, bold: true, size: 15, color: 'FFFFFF', font: 'Calibri' }),
+                                  ],
+                                }),
+                              ],
+                            })
+                        ),
+                      }),
+                      new TableRow({
+                        cantSplit: true,
+                        children: [
+                          formatPHP(gad.totalBudgetApproved),
+                          formatPHP(gad.mandatoryFivePctTarget),
+                          formatPHP(gad.gadApprovedBudget),
+                          formatPct(gad.gadShareApprovedPct),
+                          `${gad.varianceFromTarget >= 0 ? '+' : ''}${formatPHP(gad.varianceFromTarget)}`,
+                          gad.isCompliant ? 'COMPLIANT (>= 5.00%)' : 'BELOW 5.00% TARGET',
+                        ].map(
+                          (v) =>
+                            new TableCell({
+                              borders: cellBorders,
+                              shading: {
+                                fill: gad.isCompliant ? 'ECFDF5' : 'FFFBEB',
+                                type: ShadingType.CLEAR,
+                                color: 'auto',
+                              },
+                              children: [
+                                new Paragraph({
+                                  alignment: AlignmentType.CENTER,
+                                  children: [
+                                    new TextRun({ text: v, bold: true, size: 15, color: '0F172A', font: 'Calibri' }),
+                                  ],
+                                }),
+                              ],
+                            })
+                        ),
+                      }),
+                    ],
+                  }),
+                ];
+              })()
+            : []),
           new Paragraph({ spacing: { before: 120, after: 80 }, children: [] }),
           mainTable,
           new Paragraph({ spacing: { before: 160, after: 60 }, children: [] }),
@@ -730,7 +895,8 @@ export async function generateStandardDocxReport(options: {
     ],
   });
 
-  return Packer.toUint8Array(doc);
+  const buf = await Packer.toArrayBuffer(doc);
+  return new Uint8Array(buf);
 }
 
 export async function exportReportToDOCX(options: {

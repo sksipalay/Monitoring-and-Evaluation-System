@@ -1,17 +1,22 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
   Download,
+  Eye,
   FileSpreadsheet,
   Upload,
   XCircle,
 } from 'lucide-react';
 import {
   Activity,
+  DocumentTemplate,
   FiscalYear,
   Office,
+  PageOrientation,
+  PaperSize,
   Program,
+  SystemSettings,
   UploadedDocument,
   UserAccount,
 } from '../../types/ppa';
@@ -23,8 +28,15 @@ import {
   parseMonitoringWorkbook,
   triggerBlobDownload,
 } from '../../utils/excelService';
-import { formatPHP } from '../../utils/calculations';
+import {
+  computeActivityMetrics,
+  computeDashboardSummary,
+  formatPHP,
+} from '../../utils/calculations';
+import { resolveDefaultTemplate } from '../../utils/templateEngine';
+import { dataService } from '../../services/dataService';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
+import { ExportPreviewModal, PreviewExportFormat } from '../modals/ExportPreviewModal';
 import { isAdminRole } from '../../utils/rbac';
 
 interface ExcelImportExportModuleProps {
@@ -35,6 +47,7 @@ interface ExcelImportExportModuleProps {
   uploadedDocuments: UploadedDocument[];
   selectedFiscalYear: string;
   municipalityName: string;
+  settings?: SystemSettings;
   currentUser: UserAccount;
   onCommitImport: (payload: {
     newPrograms: Program[];
@@ -55,6 +68,7 @@ export function ExcelImportExportModule({
   uploadedDocuments,
   selectedFiscalYear,
   municipalityName,
+  settings,
   currentUser,
   onCommitImport,
   onLogExport,
@@ -73,6 +87,11 @@ export function ExcelImportExportModule({
   const [importing, setImporting] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [confirmImportOpen, setConfirmImportOpen] = useState(false);
+  const [templates, setTemplates] = useState<DocumentTemplate[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
+  const [paperSize, setPaperSize] = useState<PaperSize>('a4');
+  const [orientation, setOrientation] = useState<PageOrientation>('landscape');
+  const [previewModalOpen, setPreviewModalOpen] = useState(false);
 
   useEffect(() => {
     const nextFy =
@@ -80,6 +99,76 @@ export function ExcelImportExportModule({
     setImportFy(nextFy);
     setExportFy(nextFy);
   }, [selectedFiscalYear, fiscalYears]);
+
+  useEffect(() => {
+    let active = true;
+    dataService
+      .listTemplates()
+      .then((res) => {
+        if (!active) return;
+        const xlsxTemplates = (res.templates || []).filter(
+          (t) =>
+            t.isActive &&
+            t.format === 'xlsx' &&
+            (t.targetReport === 'excel_monitoring' || t.targetReport === 'all_reports')
+        );
+        setTemplates(xlsxTemplates);
+        const defTpl = resolveDefaultTemplate(xlsxTemplates, 'excel_monitoring', 'xlsx');
+        if (defTpl) {
+          setSelectedTemplateId(defTpl.id);
+          const ps = defTpl.analysis?.paperSize;
+          if (ps === 'a4' || ps === 'letter' || ps === 'legal') setPaperSize(ps);
+          if (defTpl.analysis?.orientation) setOrientation(defTpl.analysis.orientation);
+        }
+      })
+      .catch(() => {
+        /* Fallback silently when offline */
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const effectiveSettings: SystemSettings = useMemo(
+    () =>
+      settings || {
+        municipalityName,
+        provinceName: 'Province of Camarines Sur',
+        officeTitle: 'Municipal Planning and Development Office (MPDO)',
+        defaultFiscalYear: exportFy === 'ALL' ? '2026' : exportFy,
+        preparedByName: currentUser.displayName,
+        preparedByTitle: 'Planning Officer',
+        reviewedByName: '',
+        reviewedByTitle: '',
+        approvedByName: '',
+        approvedByTitle: '',
+        firebaseWebConfigJson: '',
+      },
+    [settings, municipalityName, exportFy, currentUser]
+  );
+
+  const exportPrograms = useMemo(
+    () => programs.filter((p) => exportFy === 'ALL' || p.fiscalYear === exportFy),
+    [programs, exportFy]
+  );
+
+  const exportComputedActivities = useMemo(
+    () =>
+      activities
+        .filter((a) => exportFy === 'ALL' || a.fiscalYear === exportFy)
+        .map(computeActivityMetrics),
+    [activities, exportFy]
+  );
+
+  const exportSummary = useMemo(
+    () => computeDashboardSummary(exportPrograms, exportComputedActivities),
+    [exportPrograms, exportComputedActivities]
+  );
+
+  const selectedTemplate = useMemo(
+    () => templates.find((t) => t.id === selectedTemplateId) || null,
+    [templates, selectedTemplateId]
+  );
 
   const handleFilePick = async (file: File, sheetName?: string) => {
     setParsing(true);
@@ -162,12 +251,32 @@ export function ExcelImportExportModule({
   const handleExport = async (blankTemplate: boolean) => {
     setExporting(true);
     try {
+      let templateBuffer: ArrayBuffer | null = null;
+      if (selectedTemplate) {
+        templateBuffer = await dataService.fetchTemplateBinary(selectedTemplate.id);
+      }
+
+      if (blankTemplate && templateBuffer && selectedTemplate) {
+        const blob = new Blob([templateBuffer], {
+          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        });
+        const cleanName = selectedTemplate.fileName || `${selectedTemplate.name}.xlsx`;
+        triggerBlobDownload(blob, cleanName);
+        await onLogExport(cleanName);
+        onNotify('success', `Downloaded official blank template ${cleanName}.`);
+        return;
+      }
+
       const blob = await exportMonitoringWorkbook({
         fiscalYear: exportFy,
         municipalityName,
         programs,
         activities,
         blankTemplate,
+        settings: effectiveSettings,
+        paperSize,
+        orientation,
+        templateBuffer,
       });
       const fileName = blankTemplate
         ? `Monitoring_Template_Blank_FY${exportFy}.xlsx`
@@ -287,25 +396,104 @@ export function ExcelImportExportModule({
             </div>
           </div>
 
-          <div>
-            <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">
-              Fiscal Year to Export
-            </label>
-            <select
-              value={exportFy}
-              onChange={(e) => setExportFy(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-2 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
-            >
-              {fiscalYears.map((fy) => (
-                <option key={fy.id} value={fy.year}>
-                  {fy.label}
-                </option>
-              ))}
-              <option value="ALL">All Fiscal Years Combined</option>
-            </select>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">
+                Fiscal Year to Export
+              </label>
+              <select
+                value={exportFy}
+                onChange={(e) => setExportFy(e.target.value)}
+                className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-2 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+              >
+                {fiscalYears.map((fy) => (
+                  <option key={fy.id} value={fy.year}>
+                    {fy.label}
+                  </option>
+                ))}
+                <option value="ALL">All Fiscal Years Combined</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">
+                Official Excel Template
+              </label>
+              <select
+                value={selectedTemplateId}
+                onChange={(e) => {
+                  const nextId = e.target.value;
+                  setSelectedTemplateId(nextId);
+                  const tpl = templates.find((t) => t.id === nextId);
+                  const ps = tpl?.analysis?.paperSize;
+                  if (ps === 'a4' || ps === 'letter' || ps === 'legal') setPaperSize(ps);
+                  if (tpl?.analysis?.orientation) setOrientation(tpl.analysis.orientation);
+                }}
+                className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-2 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+              >
+                <option value="">System Standard 76-Column Template</option>
+                {templates.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name} (v{t.currentVersionNumber}
+                    {t.isDefault ? ' · Default' : ''})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[12.5px] font-medium text-slate-700 dark:text-slate-300">
+                Page Size
+              </label>
+              <select
+                value={paperSize}
+                onChange={(e) => setPaperSize(e.target.value as PaperSize)}
+                className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+              >
+                <option value="a4">A4</option>
+                <option value="letter">Letter</option>
+                <option value="legal">Legal</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[12.5px] font-medium text-slate-700 dark:text-slate-300">
+                Orientation
+              </label>
+              <select
+                value={orientation}
+                onChange={(e) => setOrientation(e.target.value as PageOrientation)}
+                className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+              >
+                <option value="landscape">Landscape</option>
+                <option value="portrait">Portrait</option>
+              </select>
+            </div>
           </div>
 
-          <div className="pt-2 space-y-3">
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 px-3.5 py-2.5 text-xs flex flex-wrap items-center justify-between gap-2 text-slate-600 dark:text-slate-300">
+            <span>
+              <strong className="text-slate-900 dark:text-slate-100">{exportPrograms.length}</strong>{' '}
+              Program(s) ·{' '}
+              <strong className="text-slate-900 dark:text-slate-100">
+                {exportComputedActivities.length}
+              </strong>{' '}
+              PPA(s)
+            </span>
+            <span className="font-mono tabular-nums">
+              Revised: <strong>{formatPHP(exportSummary.totalRevisedBudget)}</strong>
+            </span>
+          </div>
+
+          <div className="pt-1 space-y-2.5">
+            <button
+              type="button"
+              onClick={() => setPreviewModalOpen(true)}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-[#163A5F]/40 dark:border-sky-500/40 bg-blue-50/70 dark:bg-sky-950/40 px-4 py-2 text-sm font-semibold text-[#163A5F] dark:text-sky-300 hover:bg-blue-100/80 dark:hover:bg-sky-950/70 transition-colors"
+            >
+              <Eye className="h-4 w-4" aria-hidden="true" />
+              <span>Preview Workbook Data Before Download</span>
+            </button>
             <button
               type="button"
               disabled={exporting}
@@ -542,6 +730,36 @@ export function ExcelImportExportModule({
         destructive={duplicateMode === 'update'}
         onCancel={() => setConfirmImportOpen(false)}
         onConfirm={handleCommit}
+      />
+
+      <ExportPreviewModal
+        open={previewModalOpen}
+        onClose={() => setPreviewModalOpen(false)}
+        reportType="annual_ppa"
+        fiscalYear={exportFy}
+        monthKey="jan"
+        programs={exportPrograms}
+        activities={exportComputedActivities}
+        settings={effectiveSettings}
+        templates={templates}
+        selectedTemplateId={selectedTemplateId}
+        onSelectTemplateId={(nextId) => {
+          setSelectedTemplateId(nextId);
+          const tpl = templates.find((t) => t.id === nextId);
+          const ps = tpl?.analysis?.paperSize;
+          if (ps === 'a4' || ps === 'letter' || ps === 'legal') setPaperSize(ps);
+          if (tpl?.analysis?.orientation) setOrientation(tpl.analysis.orientation);
+        }}
+        paperSize={paperSize}
+        onChangePaperSize={setPaperSize}
+        orientation={orientation}
+        onChangeOrientation={setOrientation}
+        onConfirmExport={async (_fmt: PreviewExportFormat) => {
+          await handleExport(false);
+          setPreviewModalOpen(false);
+        }}
+        exportingFormat={exporting ? 'xlsx' : null}
+        hideReportSpecificFormats={true}
       />
     </div>
   );

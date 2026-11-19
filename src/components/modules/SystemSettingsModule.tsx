@@ -35,6 +35,7 @@ import { useModalFocusTrap } from '../../hooks/useModalFocusTrap';
 import { DEFAULT_APP_NAME, DEFAULT_PRIVACY_NOTICE } from '../../utils/demoSeedData';
 import { isAdminRole } from '../../utils/rbac';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
+import { TemplateManagementSection } from './TemplateManagementSection';
 
 interface SystemSettingsModuleProps {
   settings: SystemSettings;
@@ -903,6 +904,9 @@ export function SystemSettingsModule({
           )}
         </div>
       </form>
+
+      {/* Official Document Templates Management */}
+      <TemplateManagementSection isAdmin={isAdmin} onNotify={onNotify} />
 
       {/* Offices & Fiscal Years */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

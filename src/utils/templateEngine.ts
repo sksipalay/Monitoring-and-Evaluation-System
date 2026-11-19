@@ -106,6 +106,32 @@ export interface CanonicalReportTable {
   emptyMessage?: string;
 }
 
+export function formatPaperSizeLabel(paperSize: PaperSize): string {
+  if (paperSize === 'letter') return 'Letter (8.5" × 11")';
+  if (paperSize === 'legal') return 'Legal (8.5" × 14")';
+  return 'A4 (210 × 297 mm)';
+}
+
+export function resolveDefaultTemplate(
+  templates: DocumentTemplate[],
+  targetReport: TemplateReportTarget,
+  format?: TemplateFormat
+): DocumentTemplate | null {
+  const active = templates.filter((t) => t.isActive && (!format || t.format === format));
+  if (active.length === 0) return null;
+  const exactDefault = active.find((t) => t.targetReport === targetReport && t.isDefault);
+  if (exactDefault) return exactDefault;
+  const exactAny = active.find((t) => t.targetReport === targetReport);
+  if (exactAny) return exactAny;
+  const globalDefault = active.find((t) => t.targetReport === 'all_reports' && t.isDefault);
+  if (globalDefault) return globalDefault;
+  if (format === 'xlsx') {
+    const monDefault = active.find((t) => t.targetReport === 'excel_monitoring' && t.isDefault);
+    if (monDefault) return monDefault;
+  }
+  return active.find((t) => t.targetReport === 'all_reports') || null;
+}
+
 export function formatFiscalYearDisplay(fiscalYear: string): string {
   return fiscalYear === 'ALL' ? 'All Fiscal Years' : `FY ${fiscalYear}`;
 }
@@ -620,15 +646,37 @@ export function validateExportDataset(options: {
   }
 
   let missingOptionalFieldsCount = 0;
+  let missingCoreFieldsCount = 0;
+  let longDescriptionCount = 0;
   for (const a of filteredActivities) {
+    if (!a.referenceNumber?.trim() || !a.description?.trim() || !a.officeName?.trim()) {
+      missingCoreFieldsCount++;
+    }
+    if ((a.description || '').length > 120 || (a.targetOutputs || '').length > 120) {
+      longDescriptionCount++;
+    }
     if (!a.targetOutputs?.trim()) missingOptionalFieldsCount++;
     if (!a.remarks?.trim()) missingOptionalFieldsCount++;
+  }
+  if (missingCoreFieldsCount > 0) {
+    issues.push({
+      severity: 'warning',
+      code: 'CORE_FIELDS_INCOMPLETE',
+      message: `${missingCoreFieldsCount} activity record(s) have blank Ref Code, Description, or Implementing Office.`,
+    });
   }
   if (missingOptionalFieldsCount > 0) {
     issues.push({
       severity: 'info',
       code: 'OPTIONAL_FIELDS_BLANK',
       message: `${missingOptionalFieldsCount} optional field value(s) (Target Outputs / Remarks) are empty and will remain blank in the exported document.`,
+    });
+  }
+  if (longDescriptionCount > 0) {
+    issues.push({
+      severity: 'info',
+      code: 'LONG_TEXT_WRAPPING',
+      message: `${longDescriptionCount} record(s) contain extended text (>120 chars); automatic text wrapping and row-height expansion are enabled.`,
     });
   }
 
@@ -810,6 +858,45 @@ export function buildTemplatePlaceholderContext(options: {
             remarks: '',
           };
         })
+      : reportType === 'gad_compliance'
+        ? gad.gadPrograms.map((s, idx) => {
+            const share =
+              gad.totalBudgetApproved > 0
+                ? round2((s.approvedBudget / gad.totalBudgetApproved) * 100)
+                : 0;
+            return {
+              index: idx + 1,
+              referenceNumber: s.program.aipRefCode,
+              aipRefCode: s.program.aipRefCode,
+              description: s.program.title,
+              programTitle: s.program.title,
+              targetOutputs: String(s.activityCount),
+              officeName: s.program.officeName,
+              sourceOfFund: s.program.sourceOfFund || '',
+              budgetClassification: s.program.sourceOfFund || '',
+              gf: formatPHP(s.gf),
+              ps: formatPHP(s.ps),
+              mooe: formatPHP(s.mooe),
+              co: formatPHP(s.co),
+              approvedBudget: formatPHP(s.approvedBudget),
+              revisedBudget: formatPHP(s.revisedBudget),
+              expenditure: formatPHP(s.annualFinancialActual),
+              remainingBudget: formatPHP(s.remainingBudget),
+              physicalTarget: formatQty(s.annualPhysicalTarget),
+              physicalActual: formatQty(s.annualPhysicalActual),
+              physicalPct: formatPct(s.physicalAccomplishmentPct),
+              financialTarget: formatPHP(s.annualFinancialTarget),
+              financialActual: formatPHP(s.annualFinancialActual),
+              financialPct: formatPct(s.financialAccomplishmentPct),
+              utilizationPct: formatPct(share),
+              monthPhysicalTarget: '',
+              monthPhysicalActual: '',
+              monthFinancialTarget: '',
+              monthFinancialActual: '',
+              status: s.budgetUtilizationPct >= 100 ? 'COMPLETED' : 'ON-GOING',
+              remarks: '',
+            };
+          })
       : filteredActivities.map((a, idx) => {
           const prog = progMap.get(a.programId);
           const bd = resolveActivityBudgetDisplay(a, prog, progSumMap.get(a.programId));
@@ -941,7 +1028,9 @@ export async function analyzeTemplateBuffer(
 
   if (format === 'xlsx') {
     const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    await wb.xlsx.load(
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+    );
     const sheetNames = wb.worksheets.map((s) => s.name);
     const primary = wb.worksheets[0];
     const placeholders = new Set<string>();
@@ -977,6 +1066,7 @@ export async function analyzeTemplateBuffer(
         let score = 0;
         const rowCols: string[] = [];
         row.eachCell((cell) => {
+          if (cell.isMerged && cell.master !== cell) return;
           const txt = excelCellToText(cell.value);
           if (!txt) return;
           rowCols.push(txt);
@@ -997,8 +1087,9 @@ export async function analyzeTemplateBuffer(
     const ps = primary?.pageSetup;
     const orientation: PageOrientation =
       ps?.orientation === 'portrait' ? 'portrait' : 'landscape';
+    const rawExcelPaperSize = Number(ps?.paperSize);
     const paperSize =
-      ps?.paperSize === 1 ? 'letter' : ps?.paperSize === 5 ? 'legal' : 'a4';
+      rawExcelPaperSize === 1 ? 'letter' : rawExcelPaperSize === 5 ? 'legal' : 'a4';
 
     if (bestScore < 2 && placeholders.size === 0) {
       warnings.push(
@@ -1065,7 +1156,8 @@ export async function analyzeTemplateBuffer(
       const cells = firstRowMatch[0].match(/<w:tc\b[\s\S]*?<\/w:tc>/g) || [];
       if (cells.length >= 3) {
         for (const c of cells) {
-          const text = extractXmlText(c).replace(/\s+/g, ' ').trim();
+          const innerXml = c.replace(/^<w:tc\b[^>]*>/, '').replace(/<\/w:tc>$/, '');
+          const text = extractXmlText(innerXml).replace(/\s+/g, ' ').trim();
           if (text) detectedColumns.push(text);
         }
         if (detectedColumns.length >= 3) break;

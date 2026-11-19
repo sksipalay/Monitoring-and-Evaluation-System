@@ -1,4 +1,4 @@
-import jsPDF from 'jspdf';
+import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
@@ -14,6 +14,7 @@ import {
 import {
   MONTHS,
   computeDashboardSummary,
+  computeGadComplianceSummary,
   formatPHP,
   formatPct,
 } from './calculations';
@@ -87,25 +88,61 @@ function buildColumnWidths(
   // Weight columns smartly so long descriptions/outputs/remarks wrap comfortably without overflowing
   const weights = headers.map((h) => {
     const low = h.toLowerCase();
-    if (low.includes('description') || low.includes('ppa') || low.includes('program title') || low.includes('gad-attributed')) {
-      return 3.0;
+    if (
+      low.includes('description') ||
+      low.includes('program title') ||
+      low.includes('gad-attributed')
+    ) {
+      return 2.9;
     }
-    if (low.includes('output') || low.includes('remark')) return 2.2;
-    if (low.includes('office') || low.includes('source')) return 1.8;
-    if (low.includes('ref')) return 1.25;
-    if (low.includes('status')) return 1.25;
-    if (low === 'ppas' || low.includes('%') || low === 'gf' || low === 'ps' || low === 'mooe' || low === 'co') {
-      return 1.05;
+    if (low.includes('output') || low.includes('remark')) return 1.9;
+    if (
+      low.includes('approved') ||
+      low.includes('revised') ||
+      low.includes('expenditure') ||
+      low.includes('remaining') ||
+      low.includes('variance') ||
+      low.includes('financial') ||
+      low.includes('utilization')
+    ) {
+      return 1.75;
+    }
+    if (low.includes('office') || low.includes('source')) return 1.5;
+    if (low.includes('ref')) return 1.3;
+    if (low.includes('status')) return 1.3;
+    if (
+      low === 'ppas' ||
+      low.includes('%') ||
+      low === 'gf' ||
+      low === 'ps' ||
+      low === 'mooe' ||
+      low === 'co'
+    ) {
+      return 1.15;
     }
     return 1.45;
   });
 
   const totalWeight = weights.reduce((a, b) => a + b, 0) || 1;
+  const minColWidth = headers.length >= 11 ? 10.5 : 12;
+  const rawWidths = weights.map((w) => Math.max(minColWidth, (w / totalWeight) * usableWidth));
+  const rawSum = rawWidths.reduce((a, b) => a + b, 0) || usableWidth;
+  const scale = usableWidth / rawSum;
+  const roundedWidths = rawWidths.map((w) => Math.round(w * scale * 100) / 100);
+
+  // Absorb rounding residual into the widest text column so total matches usableWidth exactly
+  const roundedSum = roundedWidths.reduce((a, b) => a + b, 0);
+  const residual = Math.round((usableWidth - roundedSum) * 100) / 100;
+  let widestIdx = 0;
+  for (let i = 1; i < roundedWidths.length; i++) {
+    if (roundedWidths[i] > roundedWidths[widestIdx]) widestIdx = i;
+  }
+  roundedWidths[widestIdx] = Math.round((roundedWidths[widestIdx] + residual) * 100) / 100;
+
   const styles: Record<number, { cellWidth?: number; halign?: 'left' | 'right' | 'center' }> = {};
   headers.forEach((_, idx) => {
-    const allocated = (weights[idx] / totalWeight) * usableWidth;
     styles[idx] = {
-      cellWidth: Math.max(12, Math.floor(allocated * 10) / 10),
+      cellWidth: roundedWidths[idx],
       halign: alignments[idx] || 'left',
     };
   });
@@ -301,8 +338,57 @@ export async function generateReportPDFBytes(options: {
     margin: { left: leftMargin, right: rightMargin },
   });
 
-  const summaryEndY =
+  let summaryEndY =
     ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 40) + 4;
+
+  if (reportType === 'gad_compliance') {
+    const gad = computeGadComplianceSummary(programs, filteredActivities);
+    autoTable(doc, {
+      startY: summaryEndY,
+      head: [
+        [
+          'Total LGU Approved Budget',
+          'Mandatory 5% Floor',
+          'GAD Attribution (Approved)',
+          'GAD Share %',
+          '5% Variance',
+          'Compliance Status',
+        ],
+      ],
+      body: [
+        [
+          pdfMoney(gad.totalBudgetApproved),
+          pdfMoney(gad.mandatoryFivePctTarget),
+          pdfMoney(gad.gadApprovedBudget),
+          formatPct(gad.gadShareApprovedPct),
+          `${gad.varianceFromTarget >= 0 ? '+' : ''}${pdfMoney(gad.varianceFromTarget)}`,
+          gad.isCompliant ? 'COMPLIANT (>= 5.00%)' : 'BELOW 5.00% TARGET',
+        ],
+      ],
+      styles: {
+        font: activeFont,
+        fontSize: targetOrientation === 'portrait' ? 6.5 : 7.5,
+        cellPadding: 1.5,
+        halign: 'center',
+        lineColor: [203, 213, 225],
+        lineWidth: 0.1,
+      },
+      headStyles: {
+        fillColor: [13, 148, 136],
+        textColor: 255,
+        fontStyle: 'bold',
+      },
+      bodyStyles: {
+        fillColor: gad.isCompliant ? [236, 253, 245] : [255, 251, 235],
+        fontStyle: 'bold',
+        textColor: [15, 23, 42],
+      },
+      margin: { left: leftMargin, right: rightMargin },
+    });
+    summaryEndY =
+      ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ??
+        summaryEndY + 14) + 4;
+  }
 
   const bodyRows =
     tableData.rows.length > 0
@@ -317,11 +403,11 @@ export async function generateReportPDFBytes(options: {
   const baseFontSize =
     targetOrientation === 'portrait'
       ? tableData.headers.length > 9
-        ? 6.0
-        : 6.8
+        ? 5.6
+        : 6.5
       : tableData.headers.length > 10
-        ? 7.0
-        : 7.5;
+        ? 6.5
+        : 7.4;
 
   const colStyles = buildColumnWidths(tableData.headers, tableData.alignments, usableWidth);
 
@@ -334,7 +420,10 @@ export async function generateReportPDFBytes(options: {
     styles: {
       font: activeFont,
       fontSize: baseFontSize,
-      cellPadding: targetOrientation === 'portrait' ? 1.4 : 1.8,
+      cellPadding:
+        targetOrientation === 'portrait'
+          ? { top: 1.1, bottom: 1.1, left: 0.7, right: 0.7 }
+          : { top: 1.4, bottom: 1.4, left: 1.1, right: 1.1 },
       lineColor: [203, 213, 225],
       lineWidth: 0.1,
       overflow: 'linebreak',
@@ -473,7 +562,9 @@ export async function generateReportPDFBytes(options: {
     const totalPages = allPages.length;
     allPages.forEach((p, idx) => {
       const { width } = p.getSize();
-      const footerText = `${settings.appName || 'LGU Bula PPA Monitoring System'} · ${def.title} · Page ${idx + 1} of ${totalPages}`;
+      const footerText = normalizeText(
+        `${settings.appName || 'LGU Bula PPA Monitoring System'} · ${def.title} · Page ${idx + 1} of ${totalPages}`
+      );
       const textWidth = pdfLibFont.widthOfTextAtSize(footerText, 7.5);
       p.drawText(footerText, {
         x: Math.max(18, (width - textWidth) / 2),
