@@ -20,6 +20,7 @@ import {
   ArrowRight,
   Banknote,
   BarChart3,
+  CheckCircle2,
   Clock,
   Coins,
   Database,
@@ -27,6 +28,8 @@ import {
   FileSpreadsheet,
   FolderKanban,
   FolderPlus,
+  History,
+  LayoutDashboard,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -34,10 +37,12 @@ import {
   Search,
   Target,
   TrendingUp,
+  Wallet,
   X,
 } from 'lucide-react';
 import { dataService } from '../../services/dataService';
 import { useModalFocusTrap } from '../../hooks/useModalFocusTrap';
+import { AuditLogTimeline } from '../ui/AuditLogTimeline';
 import {
   Activity,
   ActivityComputed,
@@ -197,6 +202,7 @@ export function DashboardModule({
   const canQuickAdd = userRole === 'ADMINISTRATOR' || userRole === 'ENCODER';
   const defaultMonthKey: MonthKey = MONTHS[new Date().getMonth()]?.key || 'jan';
 
+  const [dashboardTab, setDashboardTab] = useState<'overview' | 'timeline'>('overview');
   const [officeFilter, setOfficeFilter] = useState<string>('ALL');
   const [programFilter, setProgramFilter] = useState<string>('ALL');
   const [activityFilter, setActivityFilter] = useState<string>('ALL');
@@ -221,35 +227,42 @@ export function DashboardModule({
     () => setQuickAddOpen(false)
   );
 
-  // Recent Activity widget state (fetches last 5 audit logs, scoped by office for ENCODER accounts)
-  const [recentAuditLogs, setRecentAuditLogs] = useState<AuditLog[]>(() => auditLogs.slice(0, 5));
+  // Audit log timeline state (fetches up to 200 entries scoped on server; merged with reactive prop logs)
+  const [fetchedAuditLogs, setFetchedAuditLogs] = useState<AuditLog[]>(() => auditLogs);
   const [loadingAuditLogs, setLoadingAuditLogs] = useState(false);
 
-  useEffect(() => {
-    setRecentAuditLogs(auditLogs.slice(0, 5));
-  }, [auditLogs]);
-
-  const fetchRecentAuditLogs = useCallback(async () => {
-    if (isOfficeScoped) {
-      setRecentAuditLogs(auditLogs.slice(0, 5));
-      return;
-    }
+  const fetchAuditTimelineLogs = useCallback(async () => {
     setLoadingAuditLogs(true);
     try {
-      const res = await dataService.getAuditLogs(5);
+      const res = await dataService.getAuditLogs(200);
       if (Array.isArray(res.auditLogs)) {
-        setRecentAuditLogs(res.auditLogs.slice(0, 5));
+        setFetchedAuditLogs(res.auditLogs);
       }
     } catch {
-      setRecentAuditLogs(auditLogs.slice(0, 5));
+      setFetchedAuditLogs(auditLogs);
     } finally {
       setLoadingAuditLogs(false);
     }
-  }, [auditLogs, isOfficeScoped]);
+  }, [auditLogs]);
 
   useEffect(() => {
-    fetchRecentAuditLogs();
-  }, [fetchRecentAuditLogs]);
+    fetchAuditTimelineLogs();
+  }, [fetchAuditTimelineLogs]);
+
+  const timelineAuditLogs = useMemo(() => {
+    const byId = new Map<string, AuditLog>();
+    for (const log of fetchedAuditLogs) {
+      byId.set(log.id, log);
+    }
+    for (const log of auditLogs) {
+      byId.set(log.id, log);
+    }
+    return Array.from(byId.values()).sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+  }, [fetchedAuditLogs, auditLogs]);
+
+  const recentAuditLogs = useMemo(() => timelineAuditLogs.slice(0, 5), [timelineAuditLogs]);
 
   const fyPrograms = useMemo(
     () =>
@@ -294,6 +307,50 @@ export function DashboardModule({
     () => computeDashboardSummary(filteredPrograms, filteredActivities),
     [filteredPrograms, filteredActivities]
   );
+
+  const executiveSummary = useMemo(() => {
+    const actsByProgram = new Map<string, ActivityComputed[]>();
+    const activeOfficeKeys = new Set<string>();
+
+    for (const a of filteredActivities) {
+      const list = actsByProgram.get(a.programId);
+      if (list) list.push(a);
+      else actsByProgram.set(a.programId, [a]);
+      if (a.officeId || a.officeName) {
+        activeOfficeKeys.add(a.officeId || a.officeName);
+      }
+    }
+
+    let totalActivePrograms = 0;
+    for (const p of filteredPrograms) {
+      if (p.officeId || p.officeName) {
+        activeOfficeKeys.add(p.officeId || p.officeName);
+      }
+      const pActs = actsByProgram.get(p.id) || [];
+      const hasLiveActivity =
+        pActs.length === 0 || pActs.some((a) => a.status !== 'NOT IMPLEMENTED');
+      if (hasLiveActivity) {
+        totalActivePrograms++;
+      }
+    }
+
+    const completionRatePct =
+      summary.totalActivities > 0
+        ? round2((summary.completedCount / summary.totalActivities) * 100)
+        : 0;
+
+    const remainingBudgetPct =
+      summary.totalRevisedBudget > 0
+        ? round2((summary.remainingBudget / summary.totalRevisedBudget) * 100)
+        : 0;
+
+    return {
+      totalActivePrograms,
+      activeOfficeCount: activeOfficeKeys.size,
+      completionRatePct,
+      remainingBudgetPct,
+    };
+  }, [filteredPrograms, filteredActivities, summary]);
 
   const programChartData = useMemo(() => {
     return filteredPrograms.map((p) => {
@@ -653,6 +710,60 @@ export function DashboardModule({
     await saveQuickAdd(false);
   };
 
+  const renderDashboardTabBar = () => (
+    <div className="no-print flex flex-wrap items-center justify-between gap-3">
+      <div
+        className="inline-flex items-center rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-1 shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
+        role="tablist"
+        aria-label="Dashboard sections"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={dashboardTab === 'overview'}
+          onClick={() => setDashboardTab('overview')}
+          className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-xs sm:text-sm font-semibold transition-colors ${
+            dashboardTab === 'overview'
+              ? 'bg-[#163A5F] text-white shadow-xs'
+              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+          }`}
+        >
+          <LayoutDashboard className="h-4 w-4" aria-hidden="true" />
+          <span>Executive Overview</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={dashboardTab === 'timeline'}
+          onClick={() => setDashboardTab('timeline')}
+          className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-xs sm:text-sm font-semibold transition-colors ${
+            dashboardTab === 'timeline'
+              ? 'bg-[#163A5F] text-white shadow-xs'
+              : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+          }`}
+        >
+          <History className="h-4 w-4" aria-hidden="true" />
+          <span>Audit Log Timeline</span>
+          <span
+            className={`rounded-md px-1.5 py-0.5 font-mono text-[10px] font-bold tabular-nums ${
+              dashboardTab === 'timeline'
+                ? 'bg-white/20 text-white'
+                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+            }`}
+          >
+            {timelineAuditLogs.length}
+          </span>
+        </button>
+      </div>
+
+      <p className="text-xs text-slate-500 dark:text-slate-400">
+        {dashboardTab === 'overview'
+          ? `Showing FY ${selectedFiscalYear === 'ALL' ? 'All Years' : selectedFiscalYear} · ${summary.totalPrograms} program${summary.totalPrograms === 1 ? '' : 's'} · ${summary.totalActivities} PPA${summary.totalActivities === 1 ? '' : 's'}`
+          : 'Color-coded CREATE, UPDATE, and DELETE event timeline'}
+      </p>
+    </div>
+  );
+
   const renderRecentActivityWidget = () => (
     <section className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-[0_1px_2px_rgba(15,23,42,0.04)] overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200/80 dark:border-slate-800 px-5 py-4">
@@ -669,10 +780,10 @@ export function DashboardModule({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-3 no-print">
+        <div className="flex flex-wrap items-center gap-3 no-print">
           <button
             type="button"
-            onClick={fetchRecentAuditLogs}
+            onClick={fetchAuditTimelineLogs}
             disabled={loadingAuditLogs}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
             title="Refresh audit logs"
@@ -682,6 +793,14 @@ export function DashboardModule({
               aria-hidden="true"
             />
             <span>Refresh</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setDashboardTab('timeline')}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 dark:border-sky-800 bg-blue-50/70 dark:bg-sky-950/40 px-3 py-1.5 text-xs font-semibold text-[#163A5F] dark:text-sky-300 hover:bg-blue-100/80 dark:hover:bg-sky-900/50 transition-colors"
+          >
+            <History className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>Open Audit Timeline</span>
           </button>
           {userRole === 'ADMINISTRATOR' && (
             <button
@@ -749,70 +868,86 @@ export function DashboardModule({
   if (activities.length === 0 && programs.length === 0) {
     return (
       <div className="space-y-6">
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
-          <div className="max-w-2xl">
-            <p className="text-xs font-medium text-[#2563EB] dark:text-sky-400">
-              {isOfficeScoped ? `${userOfficeName} · ` : 'MPDO Initial Setup · '}Fiscal Year {selectedFiscalYear}
-            </p>
-            <h2 className="mt-2 text-[26px] font-semibold leading-tight text-slate-900 dark:text-slate-100">
-              {isOfficeScoped
-                ? `No PPA Monitoring Records for ${userOfficeName} Yet`
-                : 'No PPA Monitoring Records Loaded Yet'}
-            </h2>
-            <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-400">
-              {isOfficeScoped
-                ? `Begin by creating your office's Programs and Projects/Activities under "Programs and Activities", or download the official LGU Bula template. Every dashboard figure and chart will update automatically for ${userOfficeName}.`
-                : 'Begin by uploading your existing Monitoring Template.xlsx workbook, downloading the official LGU Bula template, or creating Programs and Activities directly in the system. Every dashboard figure and chart will compute automatically from your saved records.'}
-            </p>
-            <div className="mt-6 flex flex-wrap items-center gap-3">
-              {userRole === 'ADMINISTRATOR' && (
-                <button
-                  type="button"
-                  onClick={() => onNavigate('excel')}
-                  className="inline-flex items-center gap-2 rounded-lg bg-[#163A5F] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#1e4b7a] whitespace-nowrap shrink-0 transition-colors"
-                >
-                  <FileSpreadsheet className="h-4 w-4" aria-hidden="true" />
-                  <span>Import Monitoring Template (.xlsx)</span>
-                </button>
-              )}
-              {(userRole === 'ADMINISTRATOR' || userRole === 'ENCODER') && (
-                <button
-                  type="button"
-                  onClick={() => onNavigate('programs')}
-                  className={`inline-flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm whitespace-nowrap shrink-0 transition-colors ${
-                    userRole === 'ENCODER'
-                      ? 'bg-[#163A5F] font-semibold text-white hover:bg-[#1e4b7a]'
-                      : 'border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700'
-                  }`}
-                >
-                  <FolderPlus className="h-4 w-4" aria-hidden="true" />
-                  <span>Add Program &amp; Activity</span>
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={onDownloadTemplate}
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 whitespace-nowrap shrink-0 transition-colors"
-              >
-                <Download className="h-4 w-4" aria-hidden="true" />
-                <span>Download Official Template (.xlsx)</span>
-              </button>
-              {userRole === 'ADMINISTRATOR' && (
-                <button
-                  type="button"
-                  onClick={onLoadSampleData}
-                  className="inline-flex items-center gap-2 rounded-lg border border-blue-200 dark:border-sky-800 bg-blue-50 dark:bg-sky-950/60 px-4 py-2.5 text-sm font-medium text-[#163A5F] dark:text-sky-300 hover:bg-blue-100 dark:hover:bg-sky-900/60 whitespace-nowrap shrink-0 transition-colors"
-                >
-                  <Database className="h-4 w-4" aria-hidden="true" />
-                  <span>Load Sample LGU Bula Dataset (Demo)</span>
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
+        {renderDashboardTabBar()}
 
-        {/* Recent Activity Widget */}
-        {renderRecentActivityWidget()}
+        {dashboardTab === 'timeline' ? (
+          <AuditLogTimeline
+            logs={timelineAuditLogs}
+            loading={loadingAuditLogs}
+            isOfficeScoped={isOfficeScoped}
+            officeName={userOfficeName}
+            onRefresh={fetchAuditTimelineLogs}
+            canOpenFullAuditTable={userRole === 'ADMINISTRATOR'}
+            onOpenFullAuditTable={() => onNavigate('users')}
+          />
+        ) : (
+          <>
+            <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+              <div className="max-w-2xl">
+                <p className="text-xs font-medium text-[#2563EB] dark:text-sky-400">
+                  {isOfficeScoped ? `${userOfficeName} · ` : 'MPDO Initial Setup · '}Fiscal Year {selectedFiscalYear}
+                </p>
+                <h2 className="mt-2 text-[26px] font-semibold leading-tight text-slate-900 dark:text-slate-100">
+                  {isOfficeScoped
+                    ? `No PPA Monitoring Records for ${userOfficeName} Yet`
+                    : 'No PPA Monitoring Records Loaded Yet'}
+                </h2>
+                <p className="mt-2 text-sm leading-relaxed text-slate-600 dark:text-slate-400">
+                  {isOfficeScoped
+                    ? `Begin by creating your office's Programs and Projects/Activities under "Programs and Activities", or download the official LGU Bula template. Every dashboard figure and chart will update automatically for ${userOfficeName}.`
+                    : 'Begin by uploading your existing Monitoring Template.xlsx workbook, downloading the official LGU Bula template, or creating Programs and Activities directly in the system. Every dashboard figure and chart will compute automatically from your saved records.'}
+                </p>
+                <div className="mt-6 flex flex-wrap items-center gap-3">
+                  {userRole === 'ADMINISTRATOR' && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('excel')}
+                      className="inline-flex items-center gap-2 rounded-lg bg-[#163A5F] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#1e4b7a] whitespace-nowrap shrink-0 transition-colors"
+                    >
+                      <FileSpreadsheet className="h-4 w-4" aria-hidden="true" />
+                      <span>Import Monitoring Template (.xlsx)</span>
+                    </button>
+                  )}
+                  {(userRole === 'ADMINISTRATOR' || userRole === 'ENCODER') && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('programs')}
+                      className={`inline-flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm whitespace-nowrap shrink-0 transition-colors ${
+                        userRole === 'ENCODER'
+                          ? 'bg-[#163A5F] font-semibold text-white hover:bg-[#1e4b7a]'
+                          : 'border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700'
+                      }`}
+                    >
+                      <FolderPlus className="h-4 w-4" aria-hidden="true" />
+                      <span>Add Program &amp; Activity</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={onDownloadTemplate}
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-4 py-2.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 whitespace-nowrap shrink-0 transition-colors"
+                  >
+                    <Download className="h-4 w-4" aria-hidden="true" />
+                    <span>Download Official Template (.xlsx)</span>
+                  </button>
+                  {userRole === 'ADMINISTRATOR' && (
+                    <button
+                      type="button"
+                      onClick={onLoadSampleData}
+                      className="inline-flex items-center gap-2 rounded-lg border border-blue-200 dark:border-sky-800 bg-blue-50 dark:bg-sky-950/60 px-4 py-2.5 text-sm font-medium text-[#163A5F] dark:text-sky-300 hover:bg-blue-100 dark:hover:bg-sky-900/60 whitespace-nowrap shrink-0 transition-colors"
+                    >
+                      <Database className="h-4 w-4" aria-hidden="true" />
+                      <span>Load Sample LGU Bula Dataset (Demo)</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Recent Activity Widget */}
+            {renderRecentActivityWidget()}
+          </>
+        )}
       </div>
     );
   }
@@ -825,6 +960,20 @@ export function DashboardModule({
 
   return (
     <div className="space-y-6">
+      {renderDashboardTabBar()}
+
+      {dashboardTab === 'timeline' ? (
+        <AuditLogTimeline
+          logs={timelineAuditLogs}
+          loading={loadingAuditLogs}
+          isOfficeScoped={isOfficeScoped}
+          officeName={userOfficeName}
+          onRefresh={fetchAuditTimelineLogs}
+          canOpenFullAuditTable={userRole === 'ADMINISTRATOR'}
+          onOpenFullAuditTable={() => onNavigate('users')}
+        />
+      ) : (
+        <>
       {/* Filter Bar */}
       <section className="no-print rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
         <div className="flex flex-wrap items-end gap-3">
@@ -965,6 +1114,138 @@ export function DashboardModule({
           </div>
         );
       })()}
+
+      {/* High-Level PPA Executive Summary */}
+      <section
+        aria-label="Executive PPA Summary"
+        className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-gradient-to-r from-[#163A5F]/[0.04] via-white to-[#0D9488]/[0.04] dark:from-slate-900 dark:via-slate-900 dark:to-slate-900 p-5 shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-4 border-b border-slate-200/70 dark:border-slate-800">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-[#2563EB] dark:text-sky-400">
+              Executive PPA Summary · FY {selectedFiscalYear === 'ALL' ? 'All Years' : selectedFiscalYear}
+            </p>
+            <h2 className="text-base sm:text-[17px] font-semibold text-slate-900 dark:text-slate-100">
+              High-Level Performance &amp; Fiscal Standing
+            </h2>
+          </div>
+          <span className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1 font-mono text-[11px] font-medium text-slate-600 dark:text-slate-300 tabular-nums">
+            {executiveSummary.activeOfficeCount} Implementing{' '}
+            {executiveSummary.activeOfficeCount === 1 ? 'Office' : 'Offices'}
+          </span>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* KPI 1: Total Active Programs */}
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-950/60 p-4">
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Total Active Programs
+              </p>
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#163A5F]/10 dark:bg-sky-500/15 text-[#163A5F] dark:text-sky-400">
+                <FolderKanban className="h-4 w-4" aria-hidden="true" />
+              </div>
+            </div>
+            <div className="mt-2 flex items-baseline gap-2.5">
+              <p className="font-mono text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-100 tabular-nums">
+                {executiveSummary.totalActivePrograms}
+              </p>
+              {executiveSummary.totalActivePrograms !== summary.totalPrograms && (
+                <span className="font-mono text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                  of {summary.totalPrograms} total
+                </span>
+              )}
+            </div>
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+              Covering{' '}
+              <span className="font-mono font-semibold text-slate-700 dark:text-slate-200 tabular-nums">
+                {summary.totalActivities}
+              </span>{' '}
+              filtered PPA{summary.totalActivities === 1 ? '' : 's'} ({summary.ongoingCount} on-going,{' '}
+              {summary.pendingCount} pending)
+            </p>
+          </div>
+
+          {/* KPI 2: Completion Rate Percentage */}
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-950/60 p-4">
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Completion Rate Percentage
+              </p>
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-600/10 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">
+                <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+              </div>
+            </div>
+            <p className="mt-2 font-mono text-3xl font-bold tracking-tight text-emerald-700 dark:text-emerald-400 tabular-nums">
+              {formatPct(executiveSummary.completionRatePct)}
+            </p>
+            <div className="mt-2.5 h-1.5 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-emerald-600 dark:bg-emerald-400 transition-all"
+                style={{
+                  width: `${Math.min(100, Math.max(0, executiveSummary.completionRatePct))}%`,
+                }}
+              />
+            </div>
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+              {summary.completedCount} of {summary.totalActivities} PPAs completed · Physical{' '}
+              {formatPct(summary.overallPhysicalPct)}
+            </p>
+          </div>
+
+          {/* KPI 3: Remaining Budget */}
+          <div
+            className={`rounded-xl border p-4 ${
+              summary.remainingBudget < 0
+                ? 'border-red-300 dark:border-red-800 bg-red-50/60 dark:bg-red-950/30'
+                : 'border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-950/60'
+            }`}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Remaining Budget
+              </p>
+              <div
+                className={`flex h-8 w-8 items-center justify-center rounded-lg ${
+                  summary.remainingBudget < 0
+                    ? 'bg-red-600/15 text-red-700 dark:text-red-400'
+                    : 'bg-[#0D9488]/10 dark:bg-teal-500/15 text-[#0D9488] dark:text-teal-400'
+                }`}
+              >
+                <Wallet className="h-4 w-4" aria-hidden="true" />
+              </div>
+            </div>
+            <p
+              className={`mt-2 font-mono text-2xl sm:text-3xl font-bold tracking-tight tabular-nums ${
+                summary.remainingBudget < 0
+                  ? 'text-red-700 dark:text-red-400'
+                  : 'text-[#163A5F] dark:text-sky-400'
+              }`}
+            >
+              {formatPHP(summary.remainingBudget)}
+            </p>
+            <div className="mt-2.5 h-1.5 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all ${
+                  summary.remainingBudget < 0
+                    ? 'bg-red-600 dark:bg-red-400'
+                    : 'bg-[#0D9488] dark:bg-teal-400'
+                }`}
+                style={{
+                  width: `${Math.min(100, Math.max(0, executiveSummary.remainingBudgetPct))}%`,
+                }}
+              />
+            </div>
+            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums truncate">
+              {summary.remainingBudget < 0
+                ? 'Over revised allocation ceiling'
+                : `${formatPct(executiveSummary.remainingBudgetPct)} unspent of ${formatCompactPHP(
+                    summary.totalRevisedBudget
+                  )} revised`}
+            </p>
+          </div>
+        </div>
+      </section>
 
       {/* Primary KPI Grid */}
       <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1545,6 +1826,8 @@ export function DashboardModule({
 
       {/* Recent Activity Widget */}
       {renderRecentActivityWidget()}
+        </>
+      )}
 
       {/* Global Quick Add Daily / Periodic Accomplishment Modal */}
       {quickAddOpen && selectedQuickActivity && (
