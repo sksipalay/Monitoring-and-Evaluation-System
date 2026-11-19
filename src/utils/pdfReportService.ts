@@ -1,152 +1,271 @@
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { ActivityComputed, MonthKey, Program, SystemSettings } from '../types/ppa';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
+import {
+  ActivityComputed,
+  MonthKey,
+  PageOrientation,
+  PaperSize,
+  Program,
+  ReportType,
+  SystemSettings,
+} from '../types/ppa';
 import {
   MONTHS,
   computeDashboardSummary,
-  computeGadComplianceSummary,
   formatPHP,
   formatPct,
-  formatQty,
-  resolveActivityBudgetDisplay,
-  round2,
-  summarizeProgram,
 } from './calculations';
+import {
+  REPORT_DEFINITIONS,
+  buildReportTableData,
+  buildTemplatePlaceholderContext,
+  dataUrlToPngBytes,
+  filterActivitiesForReport,
+  formatFiscalYearDisplay,
+  formatPhDate,
+} from './templateEngine';
 
-export type ReportType =
-  | 'annual_ppa'
-  | 'monthly_accomplishment'
-  | 'physical_accomplishment'
-  | 'financial_accomplishment'
-  | 'budget_utilization'
-  | 'program_level'
-  | 'gad_compliance'
-  | 'completed_activities'
-  | 'pending_not_implemented';
+export { REPORT_DEFINITIONS };
+export type { ReportType };
 
-export const REPORT_DEFINITIONS: {
-  id: ReportType;
-  title: string;
-  description: string;
-}[] = [
-  {
-    id: 'annual_ppa',
-    title: 'Annual PPA Monitoring Report',
-    description:
-      'Comprehensive annual overview of budget, physical/financial accomplishments, and status.',
-  },
-  {
-    id: 'monthly_accomplishment',
-    title: 'Monthly Accomplishment Report',
-    description: 'Month-specific physical and financial targets versus actual expenditures.',
-  },
-  {
-    id: 'physical_accomplishment',
-    title: 'Physical Accomplishment Report',
-    description: 'Target outputs, annual physical targets, physical actuals, and accomplishment rates.',
-  },
-  {
-    id: 'financial_accomplishment',
-    title: 'Financial Accomplishment Report',
-    description: 'Financial targets versus actual financial accomplishments and variance analysis.',
-  },
-  {
-    id: 'budget_utilization',
-    title: 'Budget Utilization Report',
-    description:
-      'GF, PS, MOOE, CO, Approved Budget, Revised Budget (PS Exempt; GF/CO/MOOE − 15%), Expenditure, and Remaining Budget.',
-  },
-  {
-    id: 'program_level',
-    title: 'Program-Level Monitoring Report',
-    description: 'Aggregated budget and accomplishment summary grouped by LGU Program.',
-  },
-  {
-    id: 'gad_compliance',
-    title: 'GAD Fund & 5% Compliance Report',
-    description:
-      'Gender and Development (GAD) Fund attribution summary tracking mandatory 5% LGU budget threshold compliance.',
-  },
-  {
-    id: 'completed_activities',
-    title: 'Completed Activities Report',
-    description: 'Listing of all completed programs, projects, and activities with final utilization.',
-  },
-  {
-    id: 'pending_not_implemented',
-    title: 'Pending & Not Implemented Activities Report',
-    description: 'Action items for pending or deferred PPAs with remarks and unutilized balances.',
-  },
-];
-
-function pdfMoney(val: number): string {
-  // Use PHP prefix in PDF to ensure clean Helvetica/standard PDF font rendering
-  return formatPHP(val).replace('₱', 'PHP ');
+interface LoadedUnicodeFonts {
+  regularBase64: string;
+  boldBase64: string;
+  regularBytes: Uint8Array;
+  boldBytes: Uint8Array;
 }
 
-export function exportReportToPDF(options: {
+let cachedFontsPromise: Promise<LoadedUnicodeFonts | null> | null = null;
+
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  if (typeof btoa === 'function') return btoa(binary);
+  return Buffer.from(bytes).toString('base64');
+}
+
+async function fetchBrowserUnicodeFonts(): Promise<LoadedUnicodeFonts | null> {
+  if (typeof window === 'undefined' || typeof fetch !== 'function') return null;
+  if (!cachedFontsPromise) {
+    cachedFontsPromise = (async () => {
+      try {
+        const [regRes, boldRes] = await Promise.all([
+          fetch('/fonts/DejaVuSans.ttf'),
+          fetch('/fonts/DejaVuSans-Bold.ttf'),
+        ]);
+        if (!regRes.ok || !boldRes.ok) return null;
+        const [regBuf, boldBuf] = await Promise.all([
+          regRes.arrayBuffer(),
+          boldRes.arrayBuffer(),
+        ]);
+        const regularBytes = new Uint8Array(regBuf);
+        const boldBytes = new Uint8Array(boldBuf);
+        return {
+          regularBytes,
+          boldBytes,
+          regularBase64: uint8ToBase64(regularBytes),
+          boldBase64: uint8ToBase64(boldBytes),
+        };
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return cachedFontsPromise;
+}
+
+function buildColumnWidths(
+  headers: string[],
+  alignments: ('left' | 'right' | 'center')[],
+  usableWidth: number
+): Record<number, { cellWidth?: number; halign?: 'left' | 'right' | 'center' }> {
+  // Weight columns smartly so long descriptions/outputs/remarks wrap comfortably without overflowing
+  const weights = headers.map((h) => {
+    const low = h.toLowerCase();
+    if (low.includes('description') || low.includes('ppa') || low.includes('program title') || low.includes('gad-attributed')) {
+      return 3.0;
+    }
+    if (low.includes('output') || low.includes('remark')) return 2.2;
+    if (low.includes('office') || low.includes('source')) return 1.8;
+    if (low.includes('ref')) return 1.25;
+    if (low.includes('status')) return 1.25;
+    if (low === 'ppas' || low.includes('%') || low === 'gf' || low === 'ps' || low === 'mooe' || low === 'co') {
+      return 1.05;
+    }
+    return 1.45;
+  });
+
+  const totalWeight = weights.reduce((a, b) => a + b, 0) || 1;
+  const styles: Record<number, { cellWidth?: number; halign?: 'left' | 'right' | 'center' }> = {};
+  headers.forEach((_, idx) => {
+    const allocated = (weights[idx] / totalWeight) * usableWidth;
+    styles[idx] = {
+      cellWidth: Math.max(12, Math.floor(allocated * 10) / 10),
+      halign: alignments[idx] || 'left',
+    };
+  });
+  return styles;
+}
+
+export async function generateReportPDFBytes(options: {
   reportType: ReportType;
   fiscalYear: string;
   monthKey: MonthKey;
   programs: Program[];
   activities: ActivityComputed[];
   settings: SystemSettings;
-}): string {
-  const { reportType, fiscalYear, monthKey, programs, activities, settings } = options;
-  const def = REPORT_DEFINITIONS.find((r) => r.id === reportType)!;
-  const monthObj = MONTHS.find((m) => m.key === monthKey) || MONTHS[0];
+  paperSize?: PaperSize;
+  orientation?: PageOrientation;
+  templateBuffer?: ArrayBuffer | Uint8Array | null;
+  fontBytesOverride?: { regular: Uint8Array; bold: Uint8Array };
+}): Promise<{ bytes: Uint8Array; fileName: string; pageCount: number }> {
+  const {
+    reportType,
+    fiscalYear,
+    monthKey,
+    programs,
+    activities,
+    settings,
+    paperSize = 'a4',
+    orientation = 'landscape',
+    templateBuffer,
+    fontBytesOverride,
+  } = options;
 
-  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+  const def = REPORT_DEFINITIONS.find((r) => r.id === reportType) || REPORT_DEFINITIONS[0];
+  const monthObj = MONTHS.find((m) => m.key === monthKey) || MONTHS[0];
+  const filteredActivities = filterActivitiesForReport(reportType, activities);
+  const summary = computeDashboardSummary(programs, filteredActivities);
+  const tableData = buildReportTableData({
+    reportType,
+    fiscalYear,
+    monthKey,
+    programs,
+    activities,
+  });
+
+  const unicodeFonts: LoadedUnicodeFonts | null = fontBytesOverride
+    ? {
+        regularBytes: fontBytesOverride.regular,
+        boldBytes: fontBytesOverride.bold,
+        regularBase64: uint8ToBase64(fontBytesOverride.regular),
+        boldBase64: uint8ToBase64(fontBytesOverride.bold),
+      }
+    : await fetchBrowserUnicodeFonts();
+
+  const hasUnicodeFont = Boolean(unicodeFonts);
+  const normalizeText = (s: string) => (hasUnicodeFont ? s : s.replace(/₱/g, 'PHP '));
+  const pdfMoney = (val: number) => normalizeText(formatPHP(val));
+
+  // If official PDF template is provided, inspect its page geometry so continuation pages match
+  let targetOrientation = orientation;
+  let targetFormat: PaperSize | [number, number] = paperSize;
+  let officialPdfDoc: PDFDocument | null = null;
+
+  if (templateBuffer) {
+    const tplBytes =
+      templateBuffer instanceof Uint8Array ? templateBuffer : new Uint8Array(templateBuffer);
+    officialPdfDoc = await PDFDocument.load(tplBytes, { ignoreEncryption: true });
+    const firstPage = officialPdfDoc.getPages()[0];
+    if (firstPage) {
+      const { width, height } = firstPage.getSize();
+      targetOrientation = width > height ? 'landscape' : 'portrait';
+      // jsPDF expects [width, height] in mm when passing custom dimensions
+      const ptToMm = 25.4 / 72;
+      targetFormat = [width * ptToMm, height * ptToMm];
+    }
+  }
+
+  const doc = new jsPDF({
+    orientation: targetOrientation,
+    unit: 'mm',
+    format: targetFormat,
+  });
+
+  if (unicodeFonts) {
+    doc.addFileToVFS('DejaVuSans.ttf', unicodeFonts.regularBase64);
+    doc.addFont('DejaVuSans.ttf', 'DejaVuSans', 'normal');
+    doc.addFileToVFS('DejaVuSans-Bold.ttf', unicodeFonts.boldBase64);
+    doc.addFont('DejaVuSans-Bold.ttf', 'DejaVuSans', 'bold');
+  }
+
+  const activeFont = hasUnicodeFont ? 'DejaVuSans' : 'helvetica';
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
+  const leftMargin = 10;
+  const rightMargin = 10;
+  const usableWidth = pageWidth - leftMargin - rightMargin;
 
-  // Official LGU Header
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9);
-  doc.setTextColor(71, 85, 105);
-  doc.text(
-    `REPUBLIC OF THE PHILIPPINES  ·  ${settings.provinceName.toUpperCase()}  ·  ${settings.municipalityName.toUpperCase()}`,
-    pageWidth / 2,
-    12,
-    { align: 'center' }
-  );
+  // Render Logo / Seal if available
+  const logoBytes = await dataUrlToPngBytes(settings.appLogoDataUrl);
+  let headerTopY = 11;
+  if (logoBytes && !officialPdfDoc) {
+    try {
+      const b64Logo = `data:image/png;base64,${uint8ToBase64(logoBytes)}`;
+      doc.addImage(b64Logo, 'PNG', leftMargin + 2, 7.5, 13, 13);
+    } catch {
+      // ignore invalid image decoding
+    }
+  }
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(13);
-  doc.setTextColor(15, 41, 74);
-  doc.text(def.title.toUpperCase(), pageWidth / 2, 18, { align: 'center' });
+  if (!officialPdfDoc) {
+    // Official LGU Header
+    doc.setFont(activeFont, 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(71, 85, 105);
+    doc.text(
+      normalizeText(
+        `REPUBLIC OF THE PHILIPPINES  ·  ${settings.provinceName.toUpperCase()}  ·  ${settings.municipalityName.toUpperCase()}`
+      ),
+      pageWidth / 2,
+      headerTopY,
+      { align: 'center' }
+    );
 
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9);
-  doc.setTextColor(51, 65, 85);
-  const subline =
-    reportType === 'monthly_accomplishment'
-      ? `${settings.officeTitle}  |  Fiscal Year: ${fiscalYear}  |  Monitoring Month: ${monthObj.label}`
-      : `${settings.officeTitle}  |  Fiscal Year: ${fiscalYear}  |  Generated: ${new Date().toLocaleDateString('en-PH')}`;
-  doc.text(subline, pageWidth / 2, 23.5, { align: 'center' });
+    doc.setFont(activeFont, 'bold');
+    doc.setFontSize(targetOrientation === 'portrait' ? 11.5 : 13);
+    doc.setTextColor(15, 41, 74);
+    doc.text(def.title.toUpperCase(), pageWidth / 2, headerTopY + 6, { align: 'center' });
 
-  const filteredActivities =
-    reportType === 'completed_activities'
-      ? activities.filter((a) => a.status === 'COMPLETED')
-      : reportType === 'pending_not_implemented'
-      ? activities.filter((a) => a.status === 'PENDING' || a.status === 'NOT IMPLEMENTED')
-      : activities;
+    doc.setFont(activeFont, 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(51, 65, 85);
+    const subline =
+      reportType === 'monthly_accomplishment'
+        ? `${settings.officeTitle}  |  ${formatFiscalYearDisplay(fiscalYear)}  |  Month: ${monthObj.label}  |  ${formatPhDate()}`
+        : `${settings.officeTitle}  |  ${formatFiscalYearDisplay(fiscalYear)}  |  Generated: ${formatPhDate()}`;
+    doc.text(normalizeText(subline), pageWidth / 2, headerTopY + 11.5, { align: 'center' });
+  } else {
+    doc.setFont(activeFont, 'bold');
+    doc.setFontSize(10.5);
+    doc.setTextColor(15, 41, 74);
+    doc.text(
+      normalizeText(`${def.title} — ${formatFiscalYearDisplay(fiscalYear)} (System Data Schedule)`),
+      leftMargin,
+      12
+    );
+  }
 
-  const summary = computeDashboardSummary(programs, filteredActivities);
+  const summaryStartY = officialPdfDoc ? 16 : 27;
 
   // Executive Summary Strip Table
   autoTable(doc, {
-    startY: 27,
+    startY: summaryStartY,
     head: [
       [
         'Programs',
         'Activities',
-        'Total Approved Budget',
+        'Approved Budget',
         'Revised Budget',
-        'Total Expenditure',
+        'Expenditure',
         'Remaining Budget',
-        'Overall Physical %',
-        'Overall Financial %',
+        'Physical %',
+        'Financial %',
       ],
     ],
     body: [
@@ -162,8 +281,9 @@ export function exportReportToPDF(options: {
       ],
     ],
     styles: {
-      fontSize: 7.5,
-      cellPadding: 1.8,
+      font: activeFont,
+      fontSize: targetOrientation === 'portrait' ? 6.5 : 7.5,
+      cellPadding: 1.6,
       halign: 'center',
       lineColor: [203, 213, 225],
       lineWidth: 0.1,
@@ -178,385 +298,53 @@ export function exportReportToPDF(options: {
       fontStyle: 'bold',
       textColor: [15, 23, 42],
     },
-    margin: { left: 10, right: 10 },
+    margin: { left: leftMargin, right: rightMargin },
   });
 
   const summaryEndY =
     ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 40) + 4;
 
-  let head: string[][] = [];
-  let body: (string | number)[][] = [];
-  let foot: (string | number)[][] = [];
+  const bodyRows =
+    tableData.rows.length > 0
+      ? tableData.rows.map((r) => r.map(normalizeText))
+      : [
+          [
+            normalizeText(tableData.emptyMessage || 'No matching records.'),
+            ...Array(Math.max(0, tableData.headers.length - 1)).fill(''),
+          ],
+        ];
 
-  if (reportType === 'program_level') {
-    head = [
-      [
-        'AIP Ref',
-        'Program Title',
-        'Source of Fund',
-        'PPAs',
-        'Approved Budget',
-        'Revised Budget',
-        'Expenditure',
-        'Remaining Budget',
-        'Physical %',
-        'Financial %',
-      ],
-    ];
-    const rows = programs.map((p) => summarizeProgram(p, filteredActivities));
-    body = rows.map((s) => [
-      s.program.aipRefCode,
-      s.program.title,
-      s.program.sourceOfFund || '-',
-      s.activityCount,
-      pdfMoney(s.approvedBudget),
-      pdfMoney(s.revisedBudget),
-      pdfMoney(s.annualFinancialActual),
-      pdfMoney(s.remainingBudget),
-      formatPct(s.physicalAccomplishmentPct),
-      formatPct(s.financialAccomplishmentPct),
-    ]);
+  const baseFontSize =
+    targetOrientation === 'portrait'
+      ? tableData.headers.length > 9
+        ? 6.0
+        : 6.8
+      : tableData.headers.length > 10
+        ? 7.0
+        : 7.5;
 
-    const totApproved = round2(rows.reduce((acc, s) => acc + s.approvedBudget, 0));
-    const totRevised = round2(rows.reduce((acc, s) => acc + s.revisedBudget, 0));
-    const totUtilized = round2(rows.reduce((acc, s) => acc + s.annualFinancialActual, 0));
-    const totRemaining = round2(rows.reduce((acc, s) => acc + s.remainingBudget, 0));
-    foot = [
-      [
-        'TOTAL',
-        `${rows.length} Program(s)`,
-        '',
-        rows.reduce((acc, s) => acc + s.activityCount, 0),
-        pdfMoney(totApproved),
-        pdfMoney(totRevised),
-        pdfMoney(totUtilized),
-        pdfMoney(totRemaining),
-        formatPct(summary.overallPhysicalPct),
-        formatPct(summary.overallFinancialPct),
-      ],
-    ];
-  } else if (reportType === 'gad_compliance') {
-    const gad = computeGadComplianceSummary(programs, filteredActivities);
-    head = [
-      [
-        'AIP Ref',
-        'GAD-Attributed Program',
-        'Implementing Office',
-        'Source of Fund',
-        'PPAs',
-        'Approved Budget',
-        'Revised Budget',
-        'GAD Expenditure',
-        'Remaining GAD Budget',
-        'Share of Total Budget',
-      ],
-    ];
-    body = gad.gadPrograms.map((s) => {
-      const share =
-        gad.totalBudgetApproved > 0
-          ? round2((s.approvedBudget / gad.totalBudgetApproved) * 100)
-          : 0;
-      return [
-        s.program.aipRefCode,
-        s.program.title,
-        s.program.officeName,
-        s.program.sourceOfFund || '-',
-        s.activityCount,
-        pdfMoney(s.approvedBudget),
-        pdfMoney(s.revisedBudget),
-        pdfMoney(s.annualFinancialActual),
-        pdfMoney(s.remainingBudget),
-        formatPct(share),
-      ];
-    });
-    if (body.length === 0) {
-      body = [
-        [
-          '—',
-          'No programs currently flagged as GAD Fund (gadFund = Yes)',
-          '',
-          '',
-          0,
-          pdfMoney(0),
-          pdfMoney(0),
-          pdfMoney(0),
-          pdfMoney(0),
-          '0.00%',
-        ],
-      ];
-    }
-    foot = [
-      [
-        'GAD TOTAL',
-        `${gad.gadProgramCount} GAD Program(s) · 5% Target: ${pdfMoney(gad.mandatoryFivePctTarget)}`,
-        gad.isCompliant ? 'STATUS: COMPLIANT (>= 5.00%)' : 'STATUS: BELOW 5.00% TARGET',
-        `Variance: ${pdfMoney(gad.varianceFromTarget)}`,
-        gad.gadActivityCount,
-        pdfMoney(gad.gadApprovedBudget),
-        pdfMoney(gad.gadRevisedBudget),
-        pdfMoney(gad.gadExpenditure),
-        pdfMoney(gad.gadRemainingBudget),
-        formatPct(gad.gadShareApprovedPct),
-      ],
-    ];
-  } else if (reportType === 'monthly_accomplishment') {
-    head = [
-      [
-        'Ref Code',
-        'Program / Project / Activity',
-        'Office',
-        `${monthObj.short} Phys. Target`,
-        `${monthObj.short} Phys. Actual`,
-        `${monthObj.short} Fin. Target`,
-        `${monthObj.short} Fin. Actual`,
-        'Status',
-      ],
-    ];
-    let totPT = 0;
-    let totPA = 0;
-    let totFT = 0;
-    let totFA = 0;
-    body = filteredActivities.map((a) => {
-      const m = a.monthly[monthKey];
-      totPT += m.physicalTarget;
-      totPA += m.physicalActual;
-      totFT += m.financialTarget;
-      totFA += m.financialActual;
-      return [
-        a.referenceNumber,
-        a.description,
-        a.officeName,
-        formatQty(m.physicalTarget),
-        formatQty(m.physicalActual),
-        pdfMoney(m.financialTarget),
-        pdfMoney(m.financialActual),
-        a.status,
-      ];
-    });
-    foot = [
-      [
-        'TOTAL',
-        `${filteredActivities.length} Activity(ies)`,
-        monthObj.label,
-        formatQty(totPT),
-        formatQty(totPA),
-        pdfMoney(round2(totFT)),
-        pdfMoney(round2(totFA)),
-        '',
-      ],
-    ];
-  } else if (reportType === 'budget_utilization') {
-    head = [
-      [
-        'Ref Code',
-        'PPA Description',
-        'GF',
-        'PS',
-        'MOOE',
-        'CO',
-        'Approved Budget',
-        'Revised Budget',
-        'Expenditure',
-        'Remaining Budget',
-        'Util %',
-      ],
-    ];
-    const programLookup = new Map(programs.map((p) => [p.id, p]));
-    const programSumLookup = new Map(
-      programs.map((p) => [p.id, summarizeProgram(p, filteredActivities)])
-    );
-    body = filteredActivities.map((a) => {
-      const bd = resolveActivityBudgetDisplay(
-        a,
-        programLookup.get(a.programId),
-        programSumLookup.get(a.programId)
-      );
-      return [
-        a.referenceNumber,
-        a.description,
-        pdfMoney(bd.gf),
-        pdfMoney(bd.ps),
-        pdfMoney(bd.mooe),
-        pdfMoney(bd.co),
-        pdfMoney(bd.approvedBudget),
-        pdfMoney(bd.revisedBudget),
-        pdfMoney(bd.expenditure),
-        pdfMoney(bd.remainingBudget),
-        formatPct(bd.utilizationPct),
-      ];
-    });
-    foot = [
-      [
-        'TOTAL',
-        `${filteredActivities.length} Activity(ies)`,
-        pdfMoney(summary.totalGF),
-        pdfMoney(summary.totalPS),
-        pdfMoney(summary.totalMOOE),
-        pdfMoney(summary.totalCO),
-        pdfMoney(summary.totalApprovedBudget),
-        pdfMoney(summary.totalRevisedBudget),
-        pdfMoney(summary.totalBudgetUtilized),
-        pdfMoney(summary.remainingBudget),
-        formatPct(summary.budgetUtilizationPct),
-      ],
-    ];
-  } else if (reportType === 'physical_accomplishment') {
-    head = [
-      [
-        'Ref Code',
-        'PPA Description',
-        'Target Outputs',
-        'Office',
-        'Annual Phys. Target',
-        'Annual Phys. Actual',
-        'Physical Accomp %',
-        'Status',
-      ],
-    ];
-    body = filteredActivities.map((a) => [
-      a.referenceNumber,
-      a.description,
-      a.targetOutputs,
-      a.officeName,
-      formatQty(a.annualPhysicalTarget),
-      formatQty(a.annualPhysicalActual),
-      formatPct(a.physicalAccomplishmentPct),
-      a.status,
-    ]);
-    foot = [
-      [
-        'TOTAL',
-        `${filteredActivities.length} Activity(ies)`,
-        '',
-        '',
-        formatQty(summary.totalPhysicalTarget),
-        formatQty(summary.totalPhysicalActual),
-        formatPct(summary.overallPhysicalPct),
-        '',
-      ],
-    ];
-  } else if (reportType === 'financial_accomplishment') {
-    const programLookup = new Map(programs.map((p) => [p.id, p]));
-    const programSumLookup = new Map(
-      programs.map((p) => [p.id, summarizeProgram(p, filteredActivities)])
-    );
-    head = [
-      [
-        'Ref Code',
-        'PPA Description',
-        'Office',
-        'Revised Budget',
-        'Annual Fin. Target',
-        'Annual Fin. Actual',
-        'Variance',
-        'Fin. Accomp %',
-        'Status',
-      ],
-    ];
-    body = filteredActivities.map((a) => {
-      const bd = resolveActivityBudgetDisplay(
-        a,
-        programLookup.get(a.programId),
-        programSumLookup.get(a.programId)
-      );
-      return [
-        a.referenceNumber,
-        a.description,
-        a.officeName,
-        pdfMoney(bd.revisedBudget),
-        pdfMoney(a.annualFinancialTarget),
-        pdfMoney(a.annualFinancialActual),
-        pdfMoney(a.annualFinancialTarget - a.annualFinancialActual),
-        formatPct(a.financialAccomplishmentPct),
-        a.status,
-      ];
-    });
-    foot = [
-      [
-        'TOTAL',
-        `${filteredActivities.length} Activity(ies)`,
-        '',
-        pdfMoney(summary.totalRevisedBudget),
-        pdfMoney(summary.totalFinancialTarget),
-        pdfMoney(summary.totalFinancialActual),
-        pdfMoney(round2(summary.totalFinancialTarget - summary.totalFinancialActual)),
-        formatPct(summary.overallFinancialPct),
-        '',
-      ],
-    ];
-  } else {
-    const programLookup = new Map(programs.map((p) => [p.id, p]));
-    const programSumLookup = new Map(
-      programs.map((p) => [p.id, summarizeProgram(p, filteredActivities)])
-    );
-    head = [
-      [
-        'Ref Code',
-        'PPA Description',
-        'Office',
-        'Approved Budget',
-        'Revised Budget',
-        'Expenditure',
-        'Remaining Budget',
-        'Phys. %',
-        'Fin. %',
-        'Status',
-        'Remarks',
-      ],
-    ];
-    body = filteredActivities.map((a) => {
-      const bd = resolveActivityBudgetDisplay(
-        a,
-        programLookup.get(a.programId),
-        programSumLookup.get(a.programId)
-      );
-      return [
-        a.referenceNumber,
-        a.description,
-        a.officeName,
-        pdfMoney(bd.approvedBudget),
-        pdfMoney(bd.revisedBudget),
-        pdfMoney(bd.expenditure),
-        pdfMoney(bd.remainingBudget),
-        formatPct(a.physicalAccomplishmentPct),
-        formatPct(a.financialAccomplishmentPct),
-        a.status,
-        a.remarks || '-',
-      ];
-    });
-    foot = [
-      [
-        'TOTAL',
-        `${filteredActivities.length} Activity(ies)`,
-        '',
-        pdfMoney(summary.totalApprovedBudget),
-        pdfMoney(summary.totalRevisedBudget),
-        pdfMoney(summary.totalBudgetUtilized),
-        pdfMoney(summary.remainingBudget),
-        formatPct(summary.overallPhysicalPct),
-        formatPct(summary.overallFinancialPct),
-        '',
-        '',
-      ],
-    ];
-  }
+  const colStyles = buildColumnWidths(tableData.headers, tableData.alignments, usableWidth);
 
   autoTable(doc, {
     startY: summaryEndY,
-    head,
-    body,
-    foot,
+    head: [tableData.headers.map(normalizeText)],
+    body: bodyRows,
+    foot: [tableData.foot.map(normalizeText)],
     showFoot: 'lastPage',
     styles: {
-      fontSize: 7.5,
-      cellPadding: 2,
+      font: activeFont,
+      fontSize: baseFontSize,
+      cellPadding: targetOrientation === 'portrait' ? 1.4 : 1.8,
       lineColor: [203, 213, 225],
       lineWidth: 0.1,
+      overflow: 'linebreak',
+      valign: 'top',
     },
     headStyles: {
       fillColor: [15, 41, 74],
       textColor: 255,
       fontStyle: 'bold',
+      valign: 'middle',
     },
     footStyles: {
       fillColor: [226, 232, 240],
@@ -566,54 +354,183 @@ export function exportReportToPDF(options: {
     alternateRowStyles: {
       fillColor: [248, 250, 252],
     },
-    margin: { left: 10, right: 10, bottom: 16 },
+    columnStyles: colStyles,
+    margin: { left: leftMargin, right: rightMargin, bottom: 16 },
   });
 
   // Signatory block with automatic page break check
   let sigY =
-    ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 150) + 12;
+    ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? 150) + 11;
   if (sigY > pageHeight - 32) {
     doc.addPage();
-    sigY = 25;
+    sigY = 22;
   }
+
+  const col1X = leftMargin + 4;
+  const col2X = pageWidth / 2 - 25;
+  const col3X = pageWidth - rightMargin - 65;
 
   doc.setFontSize(8.5);
   doc.setTextColor(15, 23, 42);
-  doc.setFont('helvetica', 'normal');
-  doc.text('Prepared by:', 15, sigY);
-  doc.setFont('helvetica', 'bold');
-  doc.text(settings.preparedByName, 15, sigY + 9);
-  doc.setFont('helvetica', 'normal');
-  doc.text(settings.preparedByTitle, 15, sigY + 13.5);
 
-  doc.text('Reviewed by:', pageWidth / 2 - 30, sigY);
-  doc.setFont('helvetica', 'bold');
-  doc.text(settings.reviewedByName, pageWidth / 2 - 30, sigY + 9);
-  doc.setFont('helvetica', 'normal');
-  doc.text(settings.reviewedByTitle, pageWidth / 2 - 30, sigY + 13.5);
+  doc.setFont(activeFont, 'normal');
+  doc.text('Prepared by:', col1X, sigY);
+  doc.setFont(activeFont, 'bold');
+  doc.text(normalizeText(settings.preparedByName || ''), col1X, sigY + 9);
+  doc.setFont(activeFont, 'normal');
+  doc.text(normalizeText(settings.preparedByTitle || ''), col1X, sigY + 13.5);
 
-  doc.text('Approved by:', pageWidth - 75, sigY);
-  doc.setFont('helvetica', 'bold');
-  doc.text(settings.approvedByName, pageWidth - 75, sigY + 9);
-  doc.setFont('helvetica', 'normal');
-  doc.text(settings.approvedByTitle, pageWidth - 75, sigY + 13.5);
+  doc.text('Reviewed by:', col2X, sigY);
+  doc.setFont(activeFont, 'bold');
+  doc.text(normalizeText(settings.reviewedByName || ''), col2X, sigY + 9);
+  doc.setFont(activeFont, 'normal');
+  doc.text(normalizeText(settings.reviewedByTitle || ''), col2X, sigY + 13.5);
 
-  // Page numbering footer on all pages
+  doc.text('Approved by:', col3X, sigY);
+  doc.setFont(activeFont, 'bold');
+  doc.text(normalizeText(settings.approvedByName || ''), col3X, sigY + 9);
+  doc.setFont(activeFont, 'normal');
+  doc.text(normalizeText(settings.approvedByTitle || ''), col3X, sigY + 13.5);
+
+  const fileName = `LGU_Bula_${reportType}_FY${fiscalYear}.pdf`;
+
+  if (officialPdfDoc) {
+    // 1) Populate AcroForm fields in official template if present
+    const ctx = buildTemplatePlaceholderContext({
+      reportType,
+      fiscalYear,
+      monthKey,
+      programs,
+      activities,
+      settings,
+    });
+    officialPdfDoc.registerFontkit(fontkit);
+    const pdfLibFont = unicodeFonts
+      ? await officialPdfDoc.embedFont(unicodeFonts.regularBytes)
+      : await officialPdfDoc.embedFont(StandardFonts.Helvetica);
+
+    try {
+      const form = officialPdfDoc.getForm();
+      const fields = form.getFields();
+      for (const field of fields) {
+        const fname = field.getName();
+        const keyLower = fname.toLowerCase().replace(/[^a-z0-9]/g, '');
+        let valueToFill: string | undefined;
+
+        for (const [ctxKey, ctxVal] of Object.entries(ctx)) {
+          if (typeof ctxVal === 'string' || typeof ctxVal === 'number') {
+            if (ctxKey.toLowerCase() === keyLower) {
+              valueToFill = String(ctxVal);
+              break;
+            }
+          }
+        }
+        // Support indexed row fields like ref_1, description_1, approved_1, status_1
+        if (valueToFill === undefined) {
+          const idxMatch = /^([a-z]+)[_-]?(\d+)$/i.exec(fname);
+          if (idxMatch) {
+            const propKey = idxMatch[1].toLowerCase();
+            const rowIdx = Number(idxMatch[2]) - 1;
+            const rec = ctx.records[rowIdx];
+            if (rec) {
+              if (propKey.includes('ref')) valueToFill = rec.referenceNumber;
+              else if (propKey.includes('desc')) valueToFill = rec.description;
+              else if (propKey.includes('office')) valueToFill = rec.officeName;
+              else if (propKey.includes('approv')) valueToFill = rec.approvedBudget;
+              else if (propKey.includes('revis')) valueToFill = rec.revisedBudget;
+              else if (propKey.includes('exp')) valueToFill = rec.expenditure;
+              else if (propKey.includes('rem')) valueToFill = rec.remainingBudget;
+              else if (propKey.includes('stat')) valueToFill = rec.status;
+              else if (propKey.includes('remar')) valueToFill = rec.remarks;
+            }
+          }
+        }
+
+        if (valueToFill !== undefined) {
+          try {
+            const textField = form.getTextField(fname);
+            textField.setText(unicodeFonts ? valueToFill : valueToFill.replace(/₱/g, 'PHP '));
+            textField.updateAppearances(pdfLibFont);
+          } catch {
+            // ignore non-text AcroForm fields (e.g., checkboxes/signatures left blank)
+          }
+        }
+      }
+    } catch {
+      // No AcroForm dictionary or read-only flat PDF
+    }
+
+    // 2) Merge jsPDF generated schedule pages after the official template pages
+    const generatedBuf = doc.output('arraybuffer');
+    const generatedDoc = await PDFDocument.load(generatedBuf);
+    const copiedPages = await officialPdfDoc.copyPages(generatedDoc, generatedDoc.getPageIndices());
+    for (const cp of copiedPages) {
+      officialPdfDoc.addPage(cp);
+    }
+
+    // 3) Stamp unified Page X of Y footer across all pages
+    const allPages = officialPdfDoc.getPages();
+    const totalPages = allPages.length;
+    allPages.forEach((p, idx) => {
+      const { width } = p.getSize();
+      const footerText = `${settings.appName || 'LGU Bula PPA Monitoring System'} · ${def.title} · Page ${idx + 1} of ${totalPages}`;
+      const textWidth = pdfLibFont.widthOfTextAtSize(footerText, 7.5);
+      p.drawText(footerText, {
+        x: Math.max(18, (width - textWidth) / 2),
+        y: 12,
+        size: 7.5,
+        font: pdfLibFont,
+        color: rgb(0.39, 0.45, 0.55),
+      });
+    });
+
+    const finalBytes = await officialPdfDoc.save();
+    return { bytes: finalBytes, fileName, pageCount: totalPages };
+  }
+
+  // Standard PDF: Page numbering footer on all pages
   const totalPages = doc.getNumberOfPages();
   for (let p = 1; p <= totalPages; p++) {
     doc.setPage(p);
-    doc.setFont('helvetica', 'normal');
+    doc.setFont(activeFont, 'normal');
     doc.setFontSize(7.5);
     doc.setTextColor(100, 116, 139);
     doc.text(
-      `LGU Bula PPA Monitoring System · ${def.title} · Page ${p} of ${totalPages}`,
+      normalizeText(
+        `${settings.appName || 'LGU Bula PPA Monitoring System'} · ${def.title} · Page ${p} of ${totalPages}`
+      ),
       pageWidth / 2,
       pageHeight - 7,
       { align: 'center' }
     );
   }
 
-  const fileName = `LGU_Bula_${reportType}_FY${fiscalYear}.pdf`;
-  doc.save(fileName);
+  const outBytes = new Uint8Array(doc.output('arraybuffer'));
+  return { bytes: outBytes, fileName, pageCount: totalPages };
+}
+
+export async function exportReportToPDF(options: {
+  reportType: ReportType;
+  fiscalYear: string;
+  monthKey: MonthKey;
+  programs: Program[];
+  activities: ActivityComputed[];
+  settings: SystemSettings;
+  paperSize?: PaperSize;
+  orientation?: PageOrientation;
+  templateBuffer?: ArrayBuffer | Uint8Array | null;
+}): Promise<string> {
+  const { bytes, fileName } = await generateReportPDFBytes(options);
+  const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], {
+    type: 'application/pdf',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
   return fileName;
 }

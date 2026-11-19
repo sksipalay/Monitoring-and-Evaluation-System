@@ -136,6 +136,7 @@ export function buildOfficeEncoderAccount(
     officeName: office.name,
     position: `${office.code} Monitoring Focal Person`,
     isActive: true,
+    approvalStatus: 'APPROVED',
     createdAt: now,
     updatedAt: now,
   };
@@ -152,7 +153,10 @@ export function ensureAllOfficeAccounts(
     const hasEncoderForOffice = nextUsers.some(
       (u) =>
         u.officeId === office.id &&
-        (u.role === 'ENCODER' || (office.id === 'off-mpdo' && u.role === 'ADMINISTRATOR'))
+        (u.role === 'ENCODER' ||
+          u.role === 'OFFICE_HEAD' ||
+          (office.id === 'off-mpdo' &&
+            (u.role === 'ADMINISTRATOR' || u.role === 'SUPER_ADMIN')))
     );
     if (!hasEncoderForOffice) {
       const account = buildOfficeEncoderAccount(office, nextUsers);
@@ -213,6 +217,9 @@ export const DEFAULT_USERS: UserAccount[] = ensureAllOfficeAccounts(
 
 export const DEFAULT_APP_NAME = 'LGU Bula Program Project and Activity Monitoring System';
 
+export const DEFAULT_PRIVACY_NOTICE =
+  'In compliance with the Philippine Data Privacy Act of 2012 (RA 10173), official personnel credentials, activity logs, and municipal planning data collected by this system are used exclusively for LGU Bula program monitoring, budget tracking, and audit accountability.';
+
 export const DEFAULT_SETTINGS: SystemSettings = {
   appName: DEFAULT_APP_NAME,
   appLogoDataUrl: '',
@@ -228,6 +235,12 @@ export const DEFAULT_SETTINGS: SystemSettings = {
   approvedByTitle: 'Local Chief Executive, Municipality of Bula',
   firebaseWebConfigJson: '',
   theme: 'light',
+  allowSelfRegistration: false,
+  sessionTimeoutMinutes: 30,
+  autoBackupEnabled: true,
+  autoBackupIntervalHours: 24,
+  backupRetentionCount: 14,
+  privacyNoticeText: DEFAULT_PRIVACY_NOTICE,
 };
 
 export function buildSampleLGUBulaDataset(): {

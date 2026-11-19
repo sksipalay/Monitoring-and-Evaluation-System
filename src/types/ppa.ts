@@ -1,4 +1,12 @@
-export type UserRole = 'ADMINISTRATOR' | 'ENCODER' | 'VIEWER';
+export type UserRole =
+  | 'SUPER_ADMIN'
+  | 'ADMINISTRATOR'
+  | 'OFFICE_HEAD'
+  | 'ENCODER'
+  | 'EVALUATOR'
+  | 'VIEWER';
+
+export type ApprovalStatus = 'APPROVED' | 'PENDING' | 'REJECTED';
 
 export type ImplementationStatus =
   | 'COMPLETED'
@@ -51,6 +59,12 @@ export interface UserAccount {
   clearPasscode?: boolean;
   hasPasscode?: boolean;
   isActive: boolean;
+  approvalStatus?: ApprovalStatus;
+  mustChangePassword?: boolean;
+  allowedModules?: SidebarModule[];
+  lastLoginAt?: string;
+  lastLoginIp?: string;
+  privacyConsentAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -66,6 +80,65 @@ export interface AuthDirectoryUser {
   position: string;
   hasPasscode: boolean;
   isActive: boolean;
+}
+
+export type SessionNetworkScope = 'LOCAL' | 'PRIVATE' | 'PUBLIC' | 'UNKNOWN';
+
+export interface ActiveSessionInfo {
+  id: string;
+  createdAt: string;
+  lastActivityAt: string;
+  expiresAt: number;
+  ipAddress: string;
+  userAgent: string;
+  isCurrent: boolean;
+}
+
+export interface AdminActiveSession extends ActiveSessionInfo {
+  userId: string;
+  userName: string;
+  userEmail: string;
+  userRole: UserRole;
+  officeName: string;
+  subnet: string;
+  locationLabel: string;
+  networkZone: string;
+  scope: SessionNetworkScope;
+}
+
+export interface IpLocationGroup {
+  key: string;
+  ipAddress: string;
+  subnet: string;
+  locationLabel: string;
+  networkZone: string;
+  scope: SessionNetworkScope;
+  sessionCount: number;
+  userCount: number;
+  lastActivityAt: string;
+  users: {
+    userId: string;
+    displayName: string;
+    role: UserRole;
+    officeName: string;
+  }[];
+}
+
+export interface SessionZoneBreakdown {
+  zone: string;
+  scope: SessionNetworkScope;
+  sessionCount: number;
+  uniqueIpCount: number;
+  pct: number;
+}
+
+export interface ActiveSessionsOverview {
+  totalActiveSessions: number;
+  uniqueIpCount: number;
+  uniqueUserCount: number;
+  locationGroups: IpLocationGroup[];
+  zoneBreakdown: SessionZoneBreakdown[];
+  sessions: AdminActiveSession[];
 }
 
 export interface Office {
@@ -117,6 +190,16 @@ export interface Program {
   updatedAt: string;
 }
 
+export type MilestoneStatus = 'Pending' | 'In Progress' | 'Completed';
+
+export interface ActivityMilestone {
+  id: string;
+  title: string;
+  status: MilestoneStatus;
+  dueDate?: string;
+  completedAt?: string;
+}
+
 export interface Activity {
   id: string;
   programId: string;
@@ -142,6 +225,7 @@ export interface Activity {
   monthly: MonthlyMonitoringMap;
   status: ImplementationStatus;
   remarks: string;
+  milestones?: ActivityMilestone[];
   orderIndex?: number;
   startDate?: string;
   endDate?: string;
@@ -241,6 +325,12 @@ export interface SystemSettings {
   approvedByTitle: string;
   firebaseWebConfigJson: string;
   theme?: 'light' | 'dark';
+  allowSelfRegistration?: boolean;
+  sessionTimeoutMinutes?: number;
+  autoBackupEnabled?: boolean;
+  autoBackupIntervalHours?: number;
+  backupRetentionCount?: number;
+  privacyNoticeText?: string;
 }
 
 export interface DatabasePayload {
@@ -254,6 +344,7 @@ export interface DatabasePayload {
   auditLogs: AuditLog[];
   settings: SystemSettings;
   officeAccountsProvisioned?: boolean;
+  demoSeedAllowed?: boolean;
 }
 
 export interface BackupInfo {
@@ -262,6 +353,9 @@ export interface BackupInfo {
   sizeBytes: number;
   programCount: number;
   activityCount: number;
+  sha256?: string;
+  verified?: boolean;
+  trigger?: 'MANUAL' | 'SCHEDULED';
 }
 
 export interface AuditIntegrityResult {
@@ -282,3 +376,91 @@ export type SidebarModule =
   | 'excel'
   | 'users'
   | 'settings';
+
+export type ReportType =
+  | 'annual_ppa'
+  | 'monthly_accomplishment'
+  | 'physical_accomplishment'
+  | 'financial_accomplishment'
+  | 'budget_utilization'
+  | 'program_level'
+  | 'gad_compliance'
+  | 'completed_activities'
+  | 'pending_not_implemented';
+
+export type PaperSize = 'a4' | 'letter' | 'legal';
+export type PageOrientation = 'portrait' | 'landscape';
+export type TemplateFormat = 'xlsx' | 'docx' | 'pdf';
+export type TemplateReportTarget = ReportType | 'excel_monitoring' | 'all_reports';
+
+export interface TemplateAnalysisSummary {
+  format: TemplateFormat;
+  pageCountOrSheets: number;
+  sheetOrPageNames: string[];
+  paperSize?: string;
+  orientation?: PageOrientation;
+  detectedPlaceholders: string[];
+  detectedColumns: string[];
+  hasRowLoopTag?: boolean;
+  hasAcroFormFields?: boolean;
+  acroFormFields?: string[];
+  detectedHeaderRow?: number;
+  detectedSignatureSection?: boolean;
+  detectedLogoOrImages?: boolean;
+  warnings: string[];
+}
+
+export interface DocumentTemplateVersion {
+  id: string;
+  templateId: string;
+  versionNumber: number;
+  fileName: string;
+  mimeType: string;
+  fileSize: number;
+  sha256: string;
+  notes: string;
+  analysis: TemplateAnalysisSummary;
+  uploadedByUid: string;
+  uploadedByName: string;
+  uploadedAt: string;
+}
+
+export interface DocumentTemplate {
+  id: string;
+  name: string;
+  description: string;
+  format: TemplateFormat;
+  targetReport: TemplateReportTarget;
+  isDefault: boolean;
+  isActive: boolean;
+  currentVersionId: string;
+  currentVersionNumber: number;
+  fileName: string;
+  fileSize: number;
+  sha256: string;
+  analysis: TemplateAnalysisSummary;
+  versions: DocumentTemplateVersion[];
+  createdByUid: string;
+  createdByName: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExportValidationIssue {
+  severity: 'error' | 'warning' | 'info';
+  code: string;
+  message: string;
+}
+
+export interface ExportValidationReport {
+  valid: boolean;
+  recordCount: number;
+  programCount: number;
+  totalApprovedBudget: number;
+  totalRevisedBudget: number;
+  totalExpenditure: number;
+  missingOptionalFieldsCount: number;
+  estimatedPages: number;
+  issues: ExportValidationIssue[];
+}
+

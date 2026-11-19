@@ -22,6 +22,7 @@ import {
 import { StatusBadge } from '../ui/StatusBadge';
 import { AccomplishmentProgress } from '../ui/AccomplishmentProgress';
 import { useModalFocusTrap } from '../../hooks/useModalFocusTrap';
+import { canEditPpaStructure } from '../../utils/rbac';
 
 interface MonthlyMonitoringModuleProps {
   programs: Program[];
@@ -40,7 +41,7 @@ export function MonthlyMonitoringModule({
   userUid,
   onUpdateActivity,
 }: MonthlyMonitoringModuleProps) {
-  const canEncode = userRole === 'ADMINISTRATOR' || userRole === 'ENCODER';
+  const canEncode = canEditPpaStructure(userRole);
   const [search, setSearch] = useState('');
   const [programFilter, setProgramFilter] = useState('ALL');
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
@@ -486,7 +487,7 @@ export function MonthlyMonitoringModule({
                               type="number"
                               step="any"
                               min="0"
-                              disabled={userRole === 'VIEWER'}
+                              disabled={!canEncode}
                               value={entry.physicalTarget}
                               onChange={(e) =>
                                 updateMonthField(m.key, 'physicalTarget', e.target.value)
@@ -499,7 +500,7 @@ export function MonthlyMonitoringModule({
                               type="number"
                               step="0.01"
                               min="0"
-                              disabled={userRole === 'VIEWER'}
+                              disabled={!canEncode}
                               value={entry.financialTarget}
                               onChange={(e) =>
                                 updateMonthField(m.key, 'financialTarget', e.target.value)
@@ -512,6 +513,7 @@ export function MonthlyMonitoringModule({
                               type="number"
                               step="any"
                               min="0"
+                              disabled={!canEncode}
                               value={entry.physicalActual}
                               onChange={(e) =>
                                 updateMonthField(m.key, 'physicalActual', e.target.value)
@@ -524,6 +526,7 @@ export function MonthlyMonitoringModule({
                               type="number"
                               step="0.01"
                               min="0"
+                              disabled={!canEncode}
                               value={entry.financialActual}
                               onChange={(e) =>
                                 updateMonthField(m.key, 'financialActual', e.target.value)
@@ -579,14 +582,16 @@ export function MonthlyMonitoringModule({
                   >
                     Cancel
                   </button>
-                  <button
-                    type="submit"
-                    disabled={saving}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-[#0F294A] dark:bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-[#163864] dark:hover:bg-sky-600 disabled:opacity-50"
-                  >
-                    <Save className="h-4 w-4" />
-                    <span>{saving ? 'Saving...' : 'Save Monthly Monitoring'}</span>
-                  </button>
+                  {canEncode && (
+                    <button
+                      type="submit"
+                      disabled={saving}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-[#0F294A] dark:bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-[#163864] dark:hover:bg-sky-600 disabled:opacity-50"
+                    >
+                      <Save className="h-4 w-4" />
+                      <span>{saving ? 'Saving...' : 'Save Monthly Monitoring'}</span>
+                    </button>
+                  )}
                 </div>
               </div>
             </form>

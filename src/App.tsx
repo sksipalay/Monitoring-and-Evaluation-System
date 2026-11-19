@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3,
   Building2,
@@ -7,9 +7,11 @@ import {
   FileSpreadsheet,
   FileText,
   FolderKanban,
+  KeyRound,
   LayoutDashboard,
   LogOut,
   Menu,
+  Monitor,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -17,15 +19,17 @@ import {
   Scale,
   Search,
   Settings,
+  ShieldCheck,
   Sun,
+  UserCog,
   Users,
   Wallet,
   X,
 } from 'lucide-react';
 import {
+  ActiveSessionInfo,
   Activity,
   AuditLog,
-  AuthDirectoryUser,
   DatabasePayload,
   FiscalYear,
   ImplementationStatus,
@@ -42,17 +46,26 @@ import {
   DEFAULT_APP_NAME,
   DEFAULT_FISCAL_YEARS,
   DEFAULT_OFFICES,
+  DEFAULT_PRIVACY_NOTICE,
   DEFAULT_SETTINGS,
   DEFAULT_USERS,
 } from './utils/demoSeedData';
+import {
+  ROLE_LABELS,
+  canEditPpaStructure,
+  hasModuleAccess,
+  isAdminRole,
+  isOfficeScopedRole,
+} from './utils/rbac';
 import { exportMonitoringWorkbook, triggerBlobDownload } from './utils/excelService';
-import { buildAuditLog, dataService } from './services/dataService';
+import { AuthStatusResponse, buildAuditLog, dataService } from './services/dataService';
 import {
   initFirebaseServices,
   signInWithGoogleFirebase,
   signOutFirebase,
   testFirestoreConnection,
 } from './services/firebaseClient';
+import { useModalFocusTrap } from './hooks/useModalFocusTrap';
 import { LoginView } from './components/LoginView';
 import { ToastBanner, ToastMessage } from './components/ui/ToastBanner';
 import { DashboardModule } from './components/modules/DashboardModule';
@@ -135,17 +148,8 @@ export default function App() {
     auditLogs: [],
     settings: DEFAULT_SETTINGS,
   });
-  const [authDirectory, setAuthDirectory] = useState<AuthDirectoryUser[]>([]);
-  const [directoryOffices, setDirectoryOffices] = useState<Office[]>(DEFAULT_OFFICES);
-  const [authBranding, setAuthBranding] = useState<{
-    appName: string;
-    appLogoDataUrl: string;
-    municipalityName: string;
-  }>({
-    appName: DEFAULT_APP_NAME,
-    appLogoDataUrl: '',
-    municipalityName: DEFAULT_SETTINGS.municipalityName,
-  });
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [sessionExpiredNotice, setSessionExpiredNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   const [activeModule, setActiveModule] = useState<SidebarModule>('dashboard');
@@ -167,6 +171,35 @@ export default function App() {
     return saved === 'dark' ? 'dark' : 'light';
   });
 
+  // Profile & Security Modal State
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const [profileForm, setProfileForm] = useState({ displayName: '', position: '' });
+  const [pwForm, setPwForm] = useState({
+    currentPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  });
+  const [pwError, setPwError] = useState<string | null>(null);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [savingPw, setSavingPw] = useState(false);
+  const [activeSessions, setActiveSessions] = useState<ActiveSessionInfo[]>([]);
+  const [loadingSessions, setLoadingSessions] = useState(false);
+  const profileModalRef = useModalFocusTrap<HTMLDivElement>(
+    profileModalOpen,
+    () => setProfileModalOpen(false)
+  );
+
+  // Mandatory Password Change Modal (when mustChangePassword === true)
+  const [forcePwForm, setForcePwForm] = useState({
+    currentPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  });
+  const [forcePwError, setForcePwError] = useState<string | null>(null);
+  const [savingForcePw, setSavingForcePw] = useState(false);
+  const lastActivityRef = useRef<number>(Date.now());
+  const idleWarnedRef = useRef<boolean>(false);
+
   useEffect(() => {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(sidebarCollapsed));
   }, [sidebarCollapsed]);
@@ -178,10 +211,10 @@ export default function App() {
 
   const brandAppName = currentUser
     ? db.settings.appName?.trim() || DEFAULT_APP_NAME
-    : authBranding.appName?.trim() || DEFAULT_APP_NAME;
+    : authStatus?.branding.appName?.trim() || DEFAULT_APP_NAME;
   const brandLogoUrl = currentUser
     ? db.settings.appLogoDataUrl?.trim() || ''
-    : authBranding.appLogoDataUrl?.trim() || '';
+    : authStatus?.branding.appLogoDataUrl?.trim() || '';
 
   useEffect(() => {
     document.title = brandAppName;
@@ -203,10 +236,8 @@ export default function App() {
 
   const refreshAuthDirectory = useCallback(async () => {
     try {
-      const dir = await dataService.getAuthDirectory();
-      setAuthDirectory(dir.users);
-      setDirectoryOffices(dir.offices);
-      setAuthBranding(dir.branding);
+      const status = await dataService.getAuthStatus();
+      setAuthStatus(status);
     } catch {
       // non-fatal during background refresh
     }
@@ -236,21 +267,36 @@ export default function App() {
   }, [notify]);
 
   useEffect(() => {
+    dataService.setUnauthorizedHandler((reason) => {
+      setCurrentUser(null);
+      setProfileModalOpen(false);
+      setSessionExpiredNotice(reason || 'Your session has expired. Please sign in again.');
+      void refreshAuthDirectory();
+    });
+    return () => {
+      dataService.setUnauthorizedHandler(null);
+    };
+  }, [refreshAuthDirectory]);
+
+  useEffect(() => {
     let active = true;
     const initAuth = async () => {
       try {
-        const [dirRes, sessionRes] = await Promise.all([
-          dataService.getAuthDirectory(),
+        const [statusRes, sessionRes] = await Promise.all([
+          dataService.getAuthStatus(),
           dataService.getSession(),
         ]);
         if (!active) return;
-        setAuthDirectory(dirRes.users);
-        setDirectoryOffices(dirRes.offices);
-        setAuthBranding(dirRes.branding);
+        setAuthStatus(statusRes);
 
         if (sessionRes.authenticated && sessionRes.user) {
           setCurrentUser(sessionRes.user);
+          setSessionExpiredNotice(null);
           await loadAuthenticatedWorkspace();
+        } else if (sessionRes.expiredReason === 'IDLE_TIMEOUT') {
+          setSessionExpiredNotice('Previous session expired due to inactivity. Please sign in.');
+        } else if (sessionRes.expiredReason === 'EXPIRED') {
+          setSessionExpiredNotice('Previous session has expired. Please sign in again.');
         }
       } catch (err) {
         if (active) {
@@ -278,7 +324,7 @@ export default function App() {
   );
 
   const isOfficeScoped =
-    currentUser?.role === 'ENCODER' && Boolean(currentUser.officeId);
+    isOfficeScopedRole(currentUser?.role) && Boolean(currentUser?.officeId);
 
   const scopedRawActivities = useMemo(() => {
     if (!isOfficeScoped || !currentUser) return db.activities;
@@ -327,15 +373,12 @@ export default function App() {
   }, [db.auditLogs, db.users, isOfficeScoped, currentUser]);
 
   const visibleNavItems = useMemo(
-    () =>
-      NAV_ITEMS.filter(
-        (item) => item.id !== 'users' || currentUser?.role === 'ADMINISTRATOR'
-      ),
-    [currentUser?.role]
+    () => NAV_ITEMS.filter((item) => hasModuleAccess(currentUser, item.id)),
+    [currentUser]
   );
 
   useEffect(() => {
-    if (activeModule === 'users' && currentUser && currentUser.role !== 'ADMINISTRATOR') {
+    if (currentUser && !hasModuleAccess(currentUser, activeModule)) {
       setActiveModule('dashboard');
     }
   }, [activeModule, currentUser]);
@@ -381,8 +424,22 @@ export default function App() {
     setGlobalSearchOpen(false);
   };
 
-  const handleLocalLogin = async (userId: string, passcode: string) => {
-    const res = await dataService.login(userId, passcode);
+  const handleSetupInitialAdmin = async (payload: {
+    email: string;
+    displayName: string;
+    position: string;
+    password: string;
+    privacyAccepted: boolean;
+  }) => {
+    const res = await dataService.setupInitialAdmin(payload);
+    setSessionExpiredNotice(null);
+    setCurrentUser(res.user);
+    await loadAuthenticatedWorkspace();
+  };
+
+  const handleLocalLogin = async (email: string, password: string) => {
+    const res = await dataService.login(email, password);
+    setSessionExpiredNotice(null);
     setCurrentUser(res.user);
     await loadAuthenticatedWorkspace();
   };
@@ -392,18 +449,194 @@ export default function App() {
     const cred = await signInWithGoogleFirebase(firebaseState.auth);
     const idToken = await cred.user.getIdToken();
     const res = await dataService.firebaseLogin(idToken);
+    setSessionExpiredNotice(null);
     setCurrentUser(res.user);
     await loadAuthenticatedWorkspace();
   };
 
-  const handleLogout = async () => {
+  const handleLogout = useCallback(async () => {
     await dataService.logout().catch(() => {});
     if (firebaseState.configured && firebaseState.auth) {
       await signOutFirebase(firebaseState.auth).catch(() => {});
     }
+    setProfileModalOpen(false);
     setCurrentUser(null);
     setActiveModule('dashboard');
     await refreshAuthDirectory();
+  }, [firebaseState.auth, firebaseState.configured, refreshAuthDirectory]);
+
+  // Client-side inactivity tracker synced with SystemSettings.sessionTimeoutMinutes
+  useEffect(() => {
+    if (!currentUser) return;
+    lastActivityRef.current = Date.now();
+    idleWarnedRef.current = false;
+
+    const bumpActivity = () => {
+      lastActivityRef.current = Date.now();
+      idleWarnedRef.current = false;
+    };
+
+    const events: (keyof WindowEventMap)[] = [
+      'mousemove',
+      'mousedown',
+      'keydown',
+      'scroll',
+      'touchstart',
+    ];
+    for (const ev of events) {
+      window.addEventListener(ev, bumpActivity, { passive: true });
+    }
+
+    const timeoutMs = Math.max(5, db.settings.sessionTimeoutMinutes ?? 30) * 60 * 1000;
+    const warnMs = Math.max(60 * 1000, timeoutMs - 2 * 60 * 1000);
+
+    const interval = window.setInterval(() => {
+      const idleMs = Date.now() - lastActivityRef.current;
+      if (idleMs >= timeoutMs) {
+        setSessionExpiredNotice('Your session timed out due to inactivity. Please sign in again.');
+        void handleLogout();
+      } else if (idleMs >= warnMs && !idleWarnedRef.current) {
+        idleWarnedRef.current = true;
+        notify('error', 'Your session will expire in 2 minutes due to inactivity.');
+      }
+    }, 30000);
+
+    return () => {
+      for (const ev of events) {
+        window.removeEventListener(ev, bumpActivity);
+      }
+      window.clearInterval(interval);
+    };
+  }, [currentUser, db.settings.sessionTimeoutMinutes, handleLogout, notify]);
+
+  const openProfileModal = useCallback(async () => {
+    if (!currentUser) return;
+    setProfileForm({
+      displayName: currentUser.displayName,
+      position: currentUser.position || '',
+    });
+    setPwForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+    setPwError(null);
+    setProfileModalOpen(true);
+    setLoadingSessions(true);
+    try {
+      const res = await dataService.getSessions();
+      setActiveSessions(res.sessions || []);
+    } catch {
+      setActiveSessions([]);
+    } finally {
+      setLoadingSessions(false);
+    }
+  }, [currentUser]);
+
+  const handleSaveOwnProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser || !profileForm.displayName.trim()) return;
+    setSavingProfile(true);
+    try {
+      const res = await dataService.updateProfile(
+        profileForm.displayName.trim(),
+        profileForm.position.trim()
+      );
+      setCurrentUser(res.user);
+      setDb((prev) => ({
+        ...prev,
+        users: prev.users.map((u) => (u.id === res.user.id ? res.user : u)),
+        auditLogs: res.auditLog ? [res.auditLog, ...prev.auditLogs] : prev.auditLogs,
+      }));
+      notify('success', 'Your profile details have been updated.');
+    } catch (err) {
+      notify('error', err instanceof Error ? err.message : 'Unable to update profile.');
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const handleChangeOwnPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPwError(null);
+    if (!pwForm.currentPassword || !pwForm.newPassword) {
+      setPwError('Current and new password are required.');
+      return;
+    }
+    if (pwForm.newPassword.length < 8 || !/[A-Za-z]/.test(pwForm.newPassword) || !/\d/.test(pwForm.newPassword)) {
+      setPwError('New password must be at least 8 characters and include letters and numbers.');
+      return;
+    }
+    if (pwForm.newPassword !== pwForm.confirmPassword) {
+      setPwError('New password and confirmation do not match.');
+      return;
+    }
+    setSavingPw(true);
+    try {
+      const res = await dataService.changePassword(pwForm.currentPassword, pwForm.newPassword);
+      setCurrentUser(res.user);
+      setPwForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setDb((prev) => ({
+        ...prev,
+        users: prev.users.map((u) => (u.id === res.user.id ? res.user : u)),
+        auditLogs: res.auditLog ? [res.auditLog, ...prev.auditLogs] : prev.auditLogs,
+      }));
+      notify('success', 'Password changed successfully.');
+    } catch (err) {
+      setPwError(err instanceof Error ? err.message : 'Unable to change password.');
+    } finally {
+      setSavingPw(false);
+    }
+  };
+
+  const handleForcePasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setForcePwError(null);
+    if (!forcePwForm.currentPassword || !forcePwForm.newPassword) {
+      setForcePwError('Current and new password are required.');
+      return;
+    }
+    if (
+      forcePwForm.newPassword.length < 8 ||
+      !/[A-Za-z]/.test(forcePwForm.newPassword) ||
+      !/\d/.test(forcePwForm.newPassword)
+    ) {
+      setForcePwError('New password must be at least 8 characters and include letters and numbers.');
+      return;
+    }
+    if (forcePwForm.newPassword !== forcePwForm.confirmPassword) {
+      setForcePwError('New password and confirmation do not match.');
+      return;
+    }
+    setSavingForcePw(true);
+    try {
+      const res = await dataService.changePassword(
+        forcePwForm.currentPassword,
+        forcePwForm.newPassword
+      );
+      setCurrentUser(res.user);
+      setForcePwForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      setDb((prev) => ({
+        ...prev,
+        users: prev.users.map((u) => (u.id === res.user.id ? res.user : u)),
+        auditLogs: res.auditLog ? [res.auditLog, ...prev.auditLogs] : prev.auditLogs,
+      }));
+      notify('success', 'Password updated. Welcome to the monitoring workspace.');
+    } catch (err) {
+      setForcePwError(err instanceof Error ? err.message : 'Unable to update password.');
+    } finally {
+      setSavingForcePw(false);
+    }
+  };
+
+  const handleRevokeSession = async (sessionId: string) => {
+    try {
+      const res = await dataService.revokeSession(sessionId);
+      if (res.revokedCurrent) {
+        await handleLogout();
+        return;
+      }
+      setActiveSessions((prev) => prev.filter((s) => s.id !== sessionId));
+      notify('success', 'Session revoked.');
+    } catch (err) {
+      notify('error', err instanceof Error ? err.message : 'Unable to revoke session.');
+    }
   };
 
   // CRUD Handlers
@@ -995,7 +1228,7 @@ export default function App() {
 
   const handleSaveSettings = async (settings: SystemSettings) => {
     if (!currentUser) return;
-    if (currentUser.role !== 'ADMINISTRATOR') {
+    if (!isAdminRole(currentUser.role)) {
       notify('error', 'Only Administrators are allowed to update System Settings.');
       return;
     }
@@ -1060,7 +1293,7 @@ export default function App() {
 
   const handleUpdateOffice = async (office: Office) => {
     if (!currentUser) return;
-    if (currentUser.role !== 'ADMINISTRATOR') {
+    if (!isAdminRole(currentUser.role)) {
       notify('error', 'Only Administrators are allowed to edit Municipal Offices.');
       throw new Error('Only Administrators are allowed to edit Municipal Offices.');
     }
@@ -1203,13 +1436,20 @@ export default function App() {
     return (
       <>
         <LoginView
-          users={authDirectory}
-          offices={directoryOffices}
+          setupRequired={Boolean(authStatus?.setupRequired)}
+          allowSelfRegistration={Boolean(authStatus?.allowSelfRegistration)}
+          privacyNoticeText={authStatus?.privacyNoticeText || DEFAULT_PRIVACY_NOTICE}
+          offices={authStatus?.offices || DEFAULT_OFFICES}
           appName={brandAppName}
           appLogoDataUrl={brandLogoUrl}
           firebaseConfigured={firebaseState.configured}
           firebaseProjectId={firebaseState.projectId}
-          onSelectLocalUser={handleLocalLogin}
+          initialNotice={sessionExpiredNotice}
+          onSetupInitialAdmin={handleSetupInitialAdmin}
+          onLogin={handleLocalLogin}
+          onRegister={(payload) => dataService.register(payload)}
+          onForgotPassword={(email) => dataService.forgotPassword(email)}
+          onResetPassword={(payload) => dataService.resetPassword(payload)}
           onFirebaseGoogleSignIn={handleFirebaseGoogleSignIn}
         />
         <ToastBanner
@@ -1335,24 +1575,32 @@ export default function App() {
 
         <div className="border-t border-white/10 p-3 space-y-2">
           {!sidebarCollapsed ? (
-            <div className="flex items-center gap-2.5 rounded-lg bg-white/10 px-2.5 py-2">
+            <button
+              type="button"
+              onClick={openProfileModal}
+              className="w-full flex items-center gap-2.5 rounded-lg bg-white/10 hover:bg-white/15 px-2.5 py-2 text-left transition-colors"
+              title="Open Profile & Security"
+            >
               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-teal-500/20 text-xs font-semibold text-teal-200 ring-1 ring-teal-400/30">
                 {getInitials(currentUser.displayName)}
               </div>
               <div className="min-w-0 flex-1 text-xs">
                 <p className="font-semibold text-white truncate">{currentUser.displayName}</p>
                 <p className="text-[11px] text-slate-300 truncate">
-                  {isOfficeScoped ? currentUser.officeName : currentUser.role}
+                  {isOfficeScoped ? currentUser.officeName : ROLE_LABELS[currentUser.role] || currentUser.role}
                 </p>
               </div>
-            </div>
+              <UserCog className="h-3.5 w-3.5 text-slate-300 shrink-0" aria-hidden="true" />
+            </button>
           ) : (
-            <div
-              className="mx-auto flex h-9 w-9 items-center justify-center rounded-lg bg-white/10 text-xs font-semibold text-teal-200"
-              title={`${currentUser.displayName} (${currentUser.officeName})`}
+            <button
+              type="button"
+              onClick={openProfileModal}
+              className="mx-auto flex h-9 w-9 items-center justify-center rounded-lg bg-white/10 hover:bg-white/20 text-xs font-semibold text-teal-200 transition-colors"
+              title={`${currentUser.displayName} — Profile & Security`}
             >
               {getInitials(currentUser.displayName)}
-            </div>
+            </button>
           )}
 
           <button
@@ -1678,7 +1926,12 @@ export default function App() {
                 {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
               </button>
 
-              <div className="hidden xl:flex items-center gap-2.5 pl-2 border-l border-slate-200 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={openProfileModal}
+                className="hidden xl:flex items-center gap-2.5 pl-2 border-l border-slate-200 dark:border-slate-800 rounded-r-lg py-1 pr-2 hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors"
+                title="Open Profile, Password & Active Sessions"
+              >
                 <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#163A5F] dark:bg-sky-500/20 text-xs font-semibold text-white dark:text-sky-300">
                   {getInitials(currentUser.displayName)}
                 </div>
@@ -1687,10 +1940,10 @@ export default function App() {
                     {currentUser.displayName}
                   </p>
                   <p className="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap">
-                    {currentUser.role} · {currentUser.officeName}
+                    {ROLE_LABELS[currentUser.role] || currentUser.role} · {currentUser.officeName}
                   </p>
                 </div>
-              </div>
+              </button>
             </div>
           </div>
         </header>
@@ -1746,6 +1999,7 @@ export default function App() {
               userOfficeId={currentUser.officeId}
               userOfficeName={currentUser.officeName}
               theme={theme}
+              demoSeedAllowed={Boolean(db.demoSeedAllowed)}
               onNavigate={(m) => setActiveModule(m)}
               onDownloadTemplate={() => handleDownloadTemplate(true)}
               onLoadSampleData={handleLoadSampleData}
@@ -1803,7 +2057,7 @@ export default function App() {
               isOfficeScoped={isOfficeScoped}
               userOfficeName={currentUser.officeName}
               theme={theme}
-              canManagePrograms={currentUser.role !== 'VIEWER'}
+              canManagePrograms={canEditPpaStructure(currentUser.role)}
               onNavigateToPrograms={() => setActiveModule('programs')}
             />
           )}
@@ -1828,6 +2082,7 @@ export default function App() {
               currentUser={currentUser}
               onAddRemark={handleAddRemark}
               onDeleteRemark={handleDeleteRemark}
+              onNotify={notify}
             />
           )}
 
@@ -1892,6 +2147,13 @@ export default function App() {
               onUpdateUser={handleUpdateUser}
               onDeleteUser={handleDeleteUser}
               onProvisionOfficeAccounts={handleProvisionOfficeAccounts}
+              onUserUpdated={(updatedUser, auditLog) => {
+                setDb((prev) => ({
+                  ...prev,
+                  users: prev.users.map((u) => (u.id === updatedUser.id ? updatedUser : u)),
+                  auditLogs: auditLog ? [auditLog, ...prev.auditLogs] : prev.auditLogs,
+                }));
+              }}
               onNotify={notify}
             />
           )}
@@ -1906,6 +2168,7 @@ export default function App() {
               onChangeTheme={setTheme}
               firebaseConfigured={firebaseState.configured}
               firebaseProjectId={firebaseState.projectId}
+              demoSeedAllowed={Boolean(db.demoSeedAllowed)}
               onSaveSettings={handleSaveSettings}
               onCreateOffice={handleCreateOffice}
               onUpdateOffice={handleUpdateOffice}
@@ -1921,6 +2184,290 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      {/* Mandatory Password Change Modal */}
+      {currentUser.mustChangePassword && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/75 dark:bg-slate-950/85 backdrop-blur-xs p-4 no-print">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="force-pw-title"
+            className="w-full max-w-md rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-2xl space-y-4"
+          >
+            <div className="flex items-start gap-3 border-b border-slate-200 dark:border-slate-800 pb-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300">
+                <KeyRound className="h-5 w-5" aria-hidden="true" />
+              </div>
+              <div>
+                <h3 id="force-pw-title" className="text-[17px] font-semibold text-slate-900 dark:text-slate-100">
+                  Password Update Required
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  For account security, you must set a new personal password before continuing.
+                </p>
+              </div>
+            </div>
+
+            {forcePwError && (
+              <div
+                role="alert"
+                className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/60 px-3 py-2 text-xs text-red-700 dark:text-red-300"
+              >
+                {forcePwError}
+              </div>
+            )}
+
+            <form onSubmit={handleForcePasswordSubmit} className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  Current Password *
+                </label>
+                <input
+                  type="password"
+                  required
+                  autoComplete="current-password"
+                  value={forcePwForm.currentPassword}
+                  onChange={(e) =>
+                    setForcePwForm({ ...forcePwForm, currentPassword: e.target.value })
+                  }
+                  className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  New Password * (8+ chars, letters &amp; numbers)
+                </label>
+                <input
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                  value={forcePwForm.newPassword}
+                  onChange={(e) =>
+                    setForcePwForm({ ...forcePwForm, newPassword: e.target.value })
+                  }
+                  className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                  Confirm New Password *
+                </label>
+                <input
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                  value={forcePwForm.confirmPassword}
+                  onChange={(e) =>
+                    setForcePwForm({ ...forcePwForm, confirmPassword: e.target.value })
+                  }
+                  className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                />
+              </div>
+              <div className="flex items-center justify-between pt-2">
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="text-xs font-medium text-slate-500 hover:text-slate-800 dark:hover:text-slate-200"
+                >
+                  Sign Out
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingForcePw}
+                  className="rounded-lg bg-[#163A5F] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1E4D7B] disabled:opacity-50"
+                >
+                  {savingForcePw ? 'Updating Password...' : 'Save Password & Continue'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* User Profile, Password & Active Sessions Modal */}
+      {profileModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 dark:bg-slate-950/80 backdrop-blur-[2px] p-4 overflow-y-auto no-print">
+          <div
+            ref={profileModalRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="profile-modal-title"
+            className="my-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-2xl space-y-6"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <div>
+                <h3 id="profile-modal-title" className="text-[18px] font-semibold text-slate-900 dark:text-slate-100">
+                  My Account Profile &amp; Security
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {ROLE_LABELS[currentUser.role] || currentUser.role} · {currentUser.officeName} ·{' '}
+                  <span className="font-mono">{currentUser.email}</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setProfileModalOpen(false)}
+                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Profile Details */}
+            <form onSubmit={handleSaveOwnProfile} className="space-y-3">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Personnel Details
+              </h4>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                    Full Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={profileForm.displayName}
+                    onChange={(e) =>
+                      setProfileForm({ ...profileForm, displayName: e.target.value })
+                    }
+                    className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                    Position Title
+                  </label>
+                  <input
+                    type="text"
+                    value={profileForm.position}
+                    onChange={(e) =>
+                      setProfileForm({ ...profileForm, position: e.target.value })
+                    }
+                    className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                <span>
+                  Last Sign-In:{' '}
+                  <span className="font-mono">
+                    {currentUser.lastLoginAt
+                      ? `${new Date(currentUser.lastLoginAt).toLocaleString('en-PH')}${currentUser.lastLoginIp ? ` (${currentUser.lastLoginIp})` : ''}`
+                      : 'Current session'}
+                  </span>
+                </span>
+                <button
+                  type="submit"
+                  disabled={savingProfile}
+                  className="rounded-lg bg-[#163A5F] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#1E4D7B] disabled:opacity-50"
+                >
+                  {savingProfile ? 'Saving...' : 'Update Profile'}
+                </button>
+              </div>
+            </form>
+
+            {/* Change Password */}
+            <form
+              onSubmit={handleChangeOwnPassword}
+              className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-3"
+            >
+              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Change Password
+              </h4>
+              {pwError && (
+                <div
+                  role="alert"
+                  className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/60 px-3 py-2 text-xs text-red-700 dark:text-red-300"
+                >
+                  {pwError}
+                </div>
+              )}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <input
+                  type="password"
+                  required
+                  autoComplete="current-password"
+                  placeholder="Current password"
+                  value={pwForm.currentPassword}
+                  onChange={(e) => setPwForm({ ...pwForm, currentPassword: e.target.value })}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                />
+                <input
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                  placeholder="New password (8+ chars)"
+                  value={pwForm.newPassword}
+                  onChange={(e) => setPwForm({ ...pwForm, newPassword: e.target.value })}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                />
+                <input
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                  placeholder="Confirm new password"
+                  value={pwForm.confirmPassword}
+                  onChange={(e) => setPwForm({ ...pwForm, confirmPassword: e.target.value })}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                />
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={savingPw}
+                  className="rounded-lg border border-[#163A5F] dark:border-sky-500 px-3.5 py-1.5 text-xs font-semibold text-[#163A5F] dark:text-sky-400 hover:bg-blue-50 dark:hover:bg-sky-950/40 disabled:opacity-50"
+                >
+                  {savingPw ? 'Updating...' : 'Update Password'}
+                </button>
+              </div>
+            </form>
+
+            {/* Active Sessions */}
+            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+              <div className="flex items-center gap-1.5">
+                <Monitor className="h-4 w-4 text-[#163A5F] dark:text-sky-400" aria-hidden="true" />
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  Active Signed-In Sessions ({activeSessions.length})
+                </h4>
+              </div>
+              {loadingSessions ? (
+                <p className="text-xs text-slate-500">Loading active sessions...</p>
+              ) : activeSessions.length === 0 ? (
+                <p className="text-xs text-slate-500">No active sessions returned.</p>
+              ) : (
+                <div className="divide-y divide-slate-100 dark:divide-slate-800 rounded-lg border border-slate-200 dark:border-slate-800 max-h-44 overflow-y-auto text-xs">
+                  {activeSessions.map((s) => (
+                    <div key={s.id} className="px-3 py-2 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="font-medium text-slate-800 dark:text-slate-200 truncate">
+                          {s.isCurrent ? 'Current Session · ' : ''}
+                          <span className="font-mono text-[11px]">{s.ipAddress || 'unknown IP'}</span>
+                        </p>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                          Last active: {new Date(s.lastActivityAt).toLocaleString('en-PH')}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleRevokeSession(s.id)}
+                        className="rounded border border-red-200 dark:border-red-800 px-2 py-1 text-[11px] font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 shrink-0"
+                      >
+                        {s.isCurrent ? 'Sign Out' : 'Revoke'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* RA 10173 Privacy Policy Summary */}
+            <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 p-3 text-[11px] leading-relaxed text-slate-600 dark:text-slate-300 flex items-start gap-2">
+              <ShieldCheck className="h-4 w-4 text-[#163A5F] dark:text-sky-400 shrink-0 mt-0.5" aria-hidden="true" />
+              <span>{db.settings.privacyNoticeText || DEFAULT_PRIVACY_NOTICE}</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       <ToastBanner
         toasts={toasts}

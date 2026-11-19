@@ -2,9 +2,12 @@ import { Fragment, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   ArrowUpDown,
+  CheckCircle2,
   CheckSquare,
   ChevronDown,
   ChevronRight,
+  Circle,
+  Clock,
   Edit3,
   Eye,
   FolderPlus,
@@ -19,10 +22,12 @@ import {
 import {
   Activity,
   ActivityComputed,
+  ActivityMilestone,
   AuditLog,
   BudgetClassification,
   FiscalYear,
   ImplementationStatus,
+  MilestoneStatus,
   MonthKey,
   Office,
   Program,
@@ -48,6 +53,11 @@ import {
 } from '../../utils/calculations';
 import { StatusBadge } from '../ui/StatusBadge';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
+import {
+  canEditPpaStructure,
+  canEditStatusOrRemarks,
+  isOfficeScopedRole,
+} from '../../utils/rbac';
 import { PpaTimelineChart } from '../ui/PpaTimelineChart';
 import { SupplementalBudgetModal } from '../modals/SupplementalBudgetModal';
 
@@ -151,9 +161,9 @@ export function ProgramsActivitiesModule({
   onBulkDeleteActivities,
   onReorderActivities,
 }: ProgramsActivitiesModuleProps) {
-  const isOfficeScoped = userRole === 'ENCODER' && Boolean(userOfficeId);
-  const canEditStructure = userRole === 'ADMINISTRATOR' || userRole === 'ENCODER';
-  const canEditStatusRemarks = userRole === 'ADMINISTRATOR' || userRole === 'ENCODER';
+  const isOfficeScoped = isOfficeScopedRole(userRole) && Boolean(userOfficeId);
+  const canEditStructure = canEditPpaStructure(userRole);
+  const canEditStatusRemarks = canEditStatusOrRemarks(userRole);
   const canBulkSelect = canEditStatusRemarks || canEditStructure;
 
   const [search, setSearch] = useState('');
@@ -230,6 +240,10 @@ export function ProgramsActivitiesModule({
   });
 
   const [detailActivity, setDetailActivity] = useState<ActivityComputed | null>(null);
+  const [newMilestoneTitle, setNewMilestoneTitle] = useState('');
+  const [newMilestoneDueDate, setNewMilestoneDueDate] = useState('');
+  const [milestoneBusy, setMilestoneBusy] = useState(false);
+  const [milestoneError, setMilestoneError] = useState<string | null>(null);
   const [supplementalProgram, setSupplementalProgram] = useState<Program | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{
     type: 'program' | 'activity' | 'bulk_activity';
@@ -238,6 +252,12 @@ export function ProgramsActivitiesModule({
     label: string;
   } | null>(null);
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setNewMilestoneTitle('');
+    setNewMilestoneDueDate('');
+    setMilestoneError(null);
+  }, [detailActivity?.id]);
 
   const programModalRef = useModalFocusTrap<HTMLDivElement>(
     programModalOpen,
@@ -817,6 +837,7 @@ export function ProgramsActivitiesModule({
           monthly,
           status: actForm.status,
           remarks: actForm.remarks.trim(),
+          milestones: [],
           createdBy: userUid,
           updatedBy: userUid,
           createdAt: now,
@@ -2411,7 +2432,98 @@ export function ProgramsActivitiesModule({
       )}
 
       {/* Detail Modal */}
-      {detailActivity && (
+      {detailActivity && (() => {
+        const liveDetailActivity =
+          activities.find((a) => a.id === detailActivity.id) || detailActivity;
+        const milestones = Array.isArray(liveDetailActivity.milestones)
+          ? liveDetailActivity.milestones
+          : [];
+        const completedMilestoneCount = milestones.filter(
+          (m) => m.status === 'Completed'
+        ).length;
+        const milestoneTotal = milestones.length;
+        const milestoneCompletionPct =
+          milestoneTotal > 0 ? Math.round((completedMilestoneCount / milestoneTotal) * 100) : 0;
+
+        const persistMilestones = async (nextMilestones: ActivityMilestone[]) => {
+          setMilestoneBusy(true);
+          setMilestoneError(null);
+          try {
+            const now = new Date().toISOString();
+            const updated: Activity = {
+              ...liveDetailActivity,
+              milestones: nextMilestones,
+              updatedBy: userUid,
+              updatedAt: now,
+            };
+            await onUpdateActivity(updated);
+            setDetailActivity({
+              ...liveDetailActivity,
+              milestones: nextMilestones,
+              updatedBy: userUid,
+              updatedAt: now,
+            });
+          } catch (err) {
+            setMilestoneError(
+              err instanceof Error ? err.message : 'Unable to save milestone changes.'
+            );
+          } finally {
+            setMilestoneBusy(false);
+          }
+        };
+
+        const handleAddMilestone = async (e: React.FormEvent) => {
+          e.preventDefault();
+          const title = newMilestoneTitle.trim();
+          if (!title) return;
+          const nextItem: ActivityMilestone = {
+            id: `ms-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            title,
+            status: 'Pending',
+            ...(newMilestoneDueDate.trim() ? { dueDate: newMilestoneDueDate.trim() } : {}),
+          };
+          await persistMilestones([...milestones, nextItem]);
+          setNewMilestoneTitle('');
+          setNewMilestoneDueDate('');
+        };
+
+        const handleUpdateMilestoneStatus = async (
+          milestoneId: string,
+          nextStatus: MilestoneStatus
+        ) => {
+          const now = new Date().toISOString();
+          const next = milestones.map((m) =>
+            m.id === milestoneId
+              ? {
+                  ...m,
+                  status: nextStatus,
+                  completedAt:
+                    nextStatus === 'Completed' ? m.completedAt || now : undefined,
+                }
+              : m
+          );
+          await persistMilestones(next);
+        };
+
+        const handleDeleteMilestone = async (milestoneId: string) => {
+          await persistMilestones(milestones.filter((m) => m.id !== milestoneId));
+        };
+
+        const parentProg = programs.find((p) => p.id === liveDetailActivity.programId);
+        const progSum = parentProg
+          ? summarizeProgram(
+              parentProg,
+              activities.filter((a) => a.programId === parentProg.id)
+            )
+          : undefined;
+        const bd = resolveActivityBudgetDisplay(liveDetailActivity, parentProg, progSum);
+        const activeMonths = MONTHS.filter(
+          (m) =>
+            safeNum(liveDetailActivity.monthly[m.key]?.financialActual) > 0 ||
+            safeNum(liveDetailActivity.monthly[m.key]?.physicalActual) > 0
+        );
+
+        return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-[2px] dark:bg-slate-950/75 p-4 overflow-y-auto">
           <div
             ref={detailModalRef}
@@ -2423,10 +2535,10 @@ export function ProgramsActivitiesModule({
             <div className="flex items-start justify-between gap-4 border-b border-slate-200 dark:border-slate-800 pb-3">
               <div>
                 <p className="font-mono text-xs font-semibold text-[#2563EB] dark:text-sky-400">
-                  {detailActivity.referenceNumber} · FY {detailActivity.fiscalYear}
+                  {liveDetailActivity.referenceNumber} · FY {liveDetailActivity.fiscalYear}
                 </p>
                 <h3 id="detail-modal-title" className="mt-1 text-[18px] font-semibold text-slate-900 dark:text-slate-100">
-                  {detailActivity.description}
+                  {liveDetailActivity.description}
                 </h3>
               </div>
               <button
@@ -2439,38 +2551,22 @@ export function ProgramsActivitiesModule({
               </button>
             </div>
 
-            {(() => {
-              const parentProg = programs.find((p) => p.id === detailActivity.programId);
-              const progSum = parentProg
-                ? summarizeProgram(
-                    parentProg,
-                    activities.filter((a) => a.programId === parentProg.id)
-                  )
-                : undefined;
-              const bd = resolveActivityBudgetDisplay(detailActivity, parentProg, progSum);
-              const activeMonths = MONTHS.filter(
-                (m) =>
-                  safeNum(detailActivity.monthly[m.key]?.financialActual) > 0 ||
-                  safeNum(detailActivity.monthly[m.key]?.physicalActual) > 0
-              );
-
-              return (
                 <div className="mt-4 space-y-5">
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
                     <div>
                       <span className="text-xs text-slate-500 dark:text-slate-400">Implementing Unit</span>
-                      <p className="font-medium text-slate-900 dark:text-slate-100">{detailActivity.officeName}</p>
+                      <p className="font-medium text-slate-900 dark:text-slate-100">{liveDetailActivity.officeName}</p>
                     </div>
                     <div>
                       <span className="text-xs text-slate-500 dark:text-slate-400">Source of Fund</span>
                       <p className="font-medium text-slate-900 dark:text-slate-100">
-                        {detailActivity.sourceOfFund || detailActivity.budgetClassification}
+                        {liveDetailActivity.sourceOfFund || liveDetailActivity.budgetClassification}
                       </p>
                     </div>
                     <div className="sm:col-span-2">
                       <span className="text-xs text-slate-500 dark:text-slate-400">Actual Output</span>
                       <p className="font-medium text-slate-900 dark:text-slate-100">
-                        {detailActivity.targetOutputs || '—'}
+                        {liveDetailActivity.targetOutputs || '—'}
                       </p>
                     </div>
                     <div>
@@ -2507,14 +2603,212 @@ export function ProgramsActivitiesModule({
                     <div>
                       <span className="text-xs text-slate-500 dark:text-slate-400">Physical Actual</span>
                       <p className="font-mono font-bold text-[#163A5F] dark:text-sky-400 tabular-nums">
-                        {formatQty(detailActivity.annualPhysicalActual)}
+                        {formatQty(liveDetailActivity.annualPhysicalActual)}
                       </p>
                     </div>
                   </div>
 
+                  {/* Linked Tasks & Milestones Completion Progress Bar */}
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-700 dark:text-slate-200">
+                          Linked Tasks &amp; Milestones Progress
+                        </h4>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Completion is calculated from linked milestones marked as Completed
+                        </p>
+                      </div>
+                      <span className="font-mono text-xs font-bold text-[#163A5F] dark:text-sky-400 tabular-nums">
+                        {completedMilestoneCount} of {milestoneTotal} Completed ({milestoneCompletionPct}%)
+                      </span>
+                    </div>
+
+                    <div
+                      role="progressbar"
+                      aria-valuenow={milestoneCompletionPct}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-label="Linked tasks completion progress"
+                      className="h-2.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700"
+                    >
+                      <div
+                        className={`h-full rounded-full transition-all duration-300 ${
+                          milestoneCompletionPct === 100
+                            ? 'bg-emerald-600 dark:bg-emerald-400'
+                            : milestoneCompletionPct > 0
+                            ? 'bg-[#2563EB] dark:bg-sky-400'
+                            : 'bg-slate-400 dark:bg-slate-600'
+                        }`}
+                        style={{ width: `${milestoneCompletionPct}%` }}
+                      />
+                    </div>
+
+                    {milestoneError && (
+                      <div
+                        role="alert"
+                        className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 px-3 py-1.5 text-xs text-red-700 dark:text-red-300"
+                      >
+                        {milestoneError}
+                      </div>
+                    )}
+
+                    {milestones.length === 0 ? (
+                      <p className="text-xs text-slate-500 dark:text-slate-400 py-1">
+                        No linked tasks or milestones added yet.{canEditStructure ? ' Add a milestone below to track task-level completion.' : ''}
+                      </p>
+                    ) : (
+                      <div className="divide-y divide-slate-200/80 dark:divide-slate-700/80 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                        {milestones.map((ms) => {
+                          const isDone = ms.status === 'Completed';
+                          const isInProg = ms.status === 'In Progress';
+                          return (
+                            <div
+                              key={ms.id}
+                              className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs"
+                            >
+                              <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                                {canEditStructure ? (
+                                  <button
+                                    type="button"
+                                    disabled={milestoneBusy}
+                                    onClick={() =>
+                                      void handleUpdateMilestoneStatus(
+                                        ms.id,
+                                        isDone ? 'Pending' : 'Completed'
+                                      )
+                                    }
+                                    className="mt-0.5 shrink-0 text-slate-400 hover:text-emerald-600 dark:hover:text-emerald-400 disabled:opacity-50"
+                                    title={isDone ? 'Mark as Pending' : 'Mark as Completed'}
+                                    aria-label={isDone ? `Mark ${ms.title} as Pending` : `Mark ${ms.title} as Completed`}
+                                  >
+                                    {isDone ? (
+                                      <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                                    ) : isInProg ? (
+                                      <Clock className="h-4 w-4 text-[#2563EB] dark:text-sky-400" />
+                                    ) : (
+                                      <Circle className="h-4 w-4" />
+                                    )}
+                                  </button>
+                                ) : (
+                                  <span className="mt-0.5 shrink-0">
+                                    {isDone ? (
+                                      <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                                    ) : isInProg ? (
+                                      <Clock className="h-4 w-4 text-[#2563EB] dark:text-sky-400" />
+                                    ) : (
+                                      <Circle className="h-4 w-4 text-slate-400" />
+                                    )}
+                                  </span>
+                                )}
+                                <div className="min-w-0">
+                                  <p
+                                    className={`font-medium break-words ${
+                                      isDone
+                                        ? 'line-through text-slate-400 dark:text-slate-500'
+                                        : 'text-slate-800 dark:text-slate-200'
+                                    }`}
+                                  >
+                                    {ms.title}
+                                  </p>
+                                  {(ms.dueDate || ms.completedAt) && (
+                                    <p className="mt-0.5 font-mono text-[10px] text-slate-500 dark:text-slate-400">
+                                      {ms.dueDate ? `Due ${ms.dueDate}` : ''}
+                                      {ms.dueDate && ms.completedAt ? ' · ' : ''}
+                                      {ms.completedAt
+                                        ? `Completed ${new Date(ms.completedAt).toLocaleDateString('en-PH')}`
+                                        : ''}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {canEditStructure ? (
+                                  <>
+                                    <select
+                                      aria-label={`Status for ${ms.title}`}
+                                      disabled={milestoneBusy}
+                                      value={ms.status}
+                                      onChange={(e) =>
+                                        void handleUpdateMilestoneStatus(
+                                          ms.id,
+                                          e.target.value as MilestoneStatus
+                                        )
+                                      }
+                                      className="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 focus:border-[#2563EB] focus:outline-none disabled:opacity-50"
+                                    >
+                                      <option value="Pending">Pending</option>
+                                      <option value="In Progress">In Progress</option>
+                                      <option value="Completed">Completed</option>
+                                    </select>
+                                    <button
+                                      type="button"
+                                      disabled={milestoneBusy}
+                                      onClick={() => void handleDeleteMilestone(ms.id)}
+                                      className="rounded p-1 text-slate-400 hover:bg-red-50 dark:hover:bg-red-950/40 hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50"
+                                      title="Remove milestone"
+                                      aria-label={`Remove ${ms.title}`}
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  </>
+                                ) : (
+                                  <span
+                                    className={`font-semibold text-[11px] ${
+                                      isDone
+                                        ? 'text-emerald-700 dark:text-emerald-400'
+                                        : isInProg
+                                        ? 'text-[#2563EB] dark:text-sky-400'
+                                        : 'text-slate-500 dark:text-slate-400'
+                                    }`}
+                                  >
+                                    {ms.status}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {canEditStructure && (
+                      <form
+                        onSubmit={handleAddMilestone}
+                        className="flex flex-wrap items-center gap-2 pt-1"
+                      >
+                        <input
+                          type="text"
+                          value={newMilestoneTitle}
+                          onChange={(e) => setNewMilestoneTitle(e.target.value)}
+                          placeholder="Add linked task or milestone (e.g., Procurement Posting, Site Inspection)..."
+                          disabled={milestoneBusy}
+                          className="flex-1 min-w-[200px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-[#2563EB] focus:outline-none"
+                        />
+                        <input
+                          type="date"
+                          aria-label="Milestone due date"
+                          value={newMilestoneDueDate}
+                          onChange={(e) => setNewMilestoneDueDate(e.target.value)}
+                          disabled={milestoneBusy}
+                          className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2.5 py-1.5 text-xs font-mono text-slate-700 dark:text-slate-200 focus:border-[#2563EB] focus:outline-none"
+                        />
+                        <button
+                          type="submit"
+                          disabled={milestoneBusy || !newMilestoneTitle.trim()}
+                          className="inline-flex items-center gap-1 rounded-lg bg-[#163A5F] hover:bg-[#1E4D7B] dark:bg-[#2563EB] dark:hover:bg-[#1D4ED8] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-45 transition-colors"
+                        >
+                          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>{milestoneBusy ? 'Saving...' : 'Add Task'}</span>
+                        </button>
+                      </form>
+                    )}
+                  </div>
+
                   {/* Visual Lifecycle & Progress Timeline Chart */}
                   <PpaTimelineChart
-                    activity={detailActivity}
+                    activity={liveDetailActivity}
                     program={parentProg}
                     budgetDisplay={bd}
                   />
@@ -2534,9 +2828,9 @@ export function ProgramsActivitiesModule({
                               {m.label}:{' '}
                             </span>
                             <span className="font-mono font-semibold text-[#163A5F] dark:text-sky-400 tabular-nums">
-                              {formatPHP(detailActivity.monthly[m.key].financialActual)}
-                              {detailActivity.monthly[m.key].physicalActual > 0
-                                ? ` · Phys ${formatQty(detailActivity.monthly[m.key].physicalActual)}`
+                              {formatPHP(liveDetailActivity.monthly[m.key].financialActual)}
+                              {liveDetailActivity.monthly[m.key].physicalActual > 0
+                                ? ` · Phys ${formatQty(liveDetailActivity.monthly[m.key].physicalActual)}`
                                 : ''}
                             </span>
                           </div>
@@ -2548,9 +2842,9 @@ export function ProgramsActivitiesModule({
                   <div>
                     <span className="text-xs text-slate-500 dark:text-slate-400">Current Status &amp; Remarks</span>
                     <div className="mt-1 flex flex-wrap items-center gap-3">
-                      <StatusBadge status={detailActivity.status} />
+                      <StatusBadge status={liveDetailActivity.status} />
                       <span className="text-sm text-slate-700 dark:text-slate-300">
-                        {detailActivity.remarks || 'No remarks recorded.'}
+                        {liveDetailActivity.remarks || 'No remarks recorded.'}
                       </span>
                     </div>
                   </div>
@@ -2559,7 +2853,7 @@ export function ProgramsActivitiesModule({
                     const relatedHistory = auditLogs
                       .filter(
                         (l) =>
-                          (l.entityId === detailActivity.id ||
+                          (l.entityId === liveDetailActivity.id ||
                             (parentProg && l.entityId === parentProg.id)) &&
                           Array.isArray(l.changes) &&
                           l.changes.length > 0
@@ -2612,8 +2906,6 @@ export function ProgramsActivitiesModule({
                     );
                   })()}
                 </div>
-              );
-            })()}
 
             <div className="mt-6 flex justify-end">
               <button
@@ -2626,7 +2918,8 @@ export function ProgramsActivitiesModule({
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       <SupplementalBudgetModal
         program={supplementalProgram}

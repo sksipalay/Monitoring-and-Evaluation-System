@@ -71,6 +71,8 @@ import {
   summarizeProgram,
 } from '../../utils/calculations';
 
+import { canEditPpaStructure, isAdminRole, isOfficeScopedRole } from '../../utils/rbac';
+
 interface DashboardModuleProps {
   programs: Program[];
   activities: ActivityComputed[];
@@ -85,6 +87,7 @@ interface DashboardModuleProps {
   userOfficeId?: string;
   userOfficeName?: string;
   theme?: 'light' | 'dark';
+  demoSeedAllowed?: boolean;
   onNavigate: (module: 'programs' | 'excel' | 'users') => void;
   onDownloadTemplate: () => void;
   onLoadSampleData: () => void;
@@ -180,13 +183,14 @@ export function DashboardModule({
   userOfficeId = '',
   userOfficeName = '',
   theme = 'light',
+  demoSeedAllowed = false,
   onNavigate,
   onDownloadTemplate,
   onLoadSampleData,
   onUpdateActivity,
   onAddRemark,
 }: DashboardModuleProps) {
-  const isOfficeScoped = userRole === 'ENCODER' && Boolean(userOfficeId);
+  const isOfficeScoped = isOfficeScopedRole(userRole) && Boolean(userOfficeId);
   const isDark = theme === 'dark';
   const gridStroke = isDark ? '#334155' : '#E2E8F0';
   const tickColor = isDark ? '#94A3B8' : '#475569';
@@ -199,7 +203,7 @@ export function DashboardModule({
   };
   const pieColors = isDark ? OFFICE_PIE_COLORS_DARK : OFFICE_PIE_COLORS;
 
-  const canQuickAdd = userRole === 'ADMINISTRATOR' || userRole === 'ENCODER';
+  const canQuickAdd = canEditPpaStructure(userRole);
   const defaultMonthKey: MonthKey = MONTHS[new Date().getMonth()]?.key || 'jan';
 
   const [dashboardTab, setDashboardTab] = useState<'overview' | 'timeline'>('overview');
@@ -802,7 +806,7 @@ export function DashboardModule({
             <History className="h-3.5 w-3.5" aria-hidden="true" />
             <span>Open Audit Timeline</span>
           </button>
-          {userRole === 'ADMINISTRATOR' && (
+          {isAdminRole(userRole) && (
             <button
               type="button"
               onClick={() => onNavigate('users')}
@@ -877,7 +881,7 @@ export function DashboardModule({
             isOfficeScoped={isOfficeScoped}
             officeName={userOfficeName}
             onRefresh={fetchAuditTimelineLogs}
-            canOpenFullAuditTable={userRole === 'ADMINISTRATOR'}
+            canOpenFullAuditTable={isAdminRole(userRole)}
             onOpenFullAuditTable={() => onNavigate('users')}
           />
         ) : (
@@ -898,7 +902,7 @@ export function DashboardModule({
                     : 'Begin by uploading your existing Monitoring Template.xlsx workbook, downloading the official LGU Bula template, or creating Programs and Activities directly in the system. Every dashboard figure and chart will compute automatically from your saved records.'}
                 </p>
                 <div className="mt-6 flex flex-wrap items-center gap-3">
-                  {userRole === 'ADMINISTRATOR' && (
+                  {isAdminRole(userRole) && (
                     <button
                       type="button"
                       onClick={() => onNavigate('excel')}
@@ -908,12 +912,12 @@ export function DashboardModule({
                       <span>Import Monitoring Template (.xlsx)</span>
                     </button>
                   )}
-                  {(userRole === 'ADMINISTRATOR' || userRole === 'ENCODER') && (
+                  {canEditPpaStructure(userRole) && (
                     <button
                       type="button"
                       onClick={() => onNavigate('programs')}
                       className={`inline-flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm whitespace-nowrap shrink-0 transition-colors ${
-                        userRole === 'ENCODER'
+                        isOfficeScopedRole(userRole)
                           ? 'bg-[#163A5F] font-semibold text-white hover:bg-[#1e4b7a]'
                           : 'border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700'
                       }`}
@@ -930,7 +934,7 @@ export function DashboardModule({
                     <Download className="h-4 w-4" aria-hidden="true" />
                     <span>Download Official Template (.xlsx)</span>
                   </button>
-                  {userRole === 'ADMINISTRATOR' && (
+                  {demoSeedAllowed && isAdminRole(userRole) && (
                     <button
                       type="button"
                       onClick={onLoadSampleData}
@@ -969,7 +973,7 @@ export function DashboardModule({
           isOfficeScoped={isOfficeScoped}
           officeName={userOfficeName}
           onRefresh={fetchAuditTimelineLogs}
-          canOpenFullAuditTable={userRole === 'ADMINISTRATOR'}
+          canOpenFullAuditTable={isAdminRole(userRole)}
           onOpenFullAuditTable={() => onNavigate('users')}
         />
       ) : (
@@ -1245,6 +1249,121 @@ export function DashboardModule({
             </p>
           </div>
         </div>
+      </section>
+
+      {/* Visual Progress Overview: Total PPA Count vs Completion Status Donut Chart */}
+      <section
+        aria-label="Visual Progress Overview"
+        className="print-avoid-break rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-4 border-b border-slate-200/70 dark:border-slate-800">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-[#2563EB] dark:text-sky-400">
+              Visual Progress Overview
+            </p>
+            <h2 className="text-base sm:text-[17px] font-semibold text-slate-900 dark:text-slate-100">
+              Total PPA Count vs. Completion Status
+            </h2>
+          </div>
+          <span className="font-mono text-xs font-semibold text-slate-600 dark:text-slate-300 tabular-nums">
+            {summary.completedCount} / {summary.totalActivities} Completed (
+            {formatPct(executiveSummary.completionRatePct)})
+          </span>
+        </div>
+
+        {summary.totalActivities === 0 ? (
+          <div className="flex h-56 items-center justify-center text-center">
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              No PPA records match the active fiscal year or office filter.
+            </p>
+          </div>
+        ) : (
+          <div className="mt-4 grid grid-cols-1 lg:grid-cols-12 gap-6 items-center">
+            <div className="lg:col-span-5 relative h-64 w-full">
+              <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+                <PieChart>
+                  <Pie
+                    data={statusDistData.filter((d) => d.value > 0)}
+                    dataKey="value"
+                    nameKey="name"
+                    cx="50%"
+                    cy="50%"
+                    innerRadius={70}
+                    outerRadius={100}
+                    paddingAngle={2.5}
+                    strokeWidth={0}
+                  >
+                    {statusDistData
+                      .filter((d) => d.value > 0)
+                      .map((entry) => (
+                        <Cell key={entry.name} fill={STATUS_COLORS[entry.name]} />
+                      ))}
+                  </Pie>
+                  <Tooltip
+                    contentStyle={tooltipStyle}
+                    formatter={(value, name) => {
+                      const count = Number(value) || 0;
+                      const pct =
+                        summary.totalActivities > 0
+                          ? (count / summary.totalActivities) * 100
+                          : 0;
+                      return [`${count} PPA${count === 1 ? '' : 's'} (${formatPct(pct)})`, String(name)];
+                    }}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center text-center">
+                <span className="font-mono text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-100 tabular-nums">
+                  {summary.totalActivities}
+                </span>
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  Total PPAs
+                </span>
+              </div>
+            </div>
+
+            <div className="lg:col-span-7 grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {statusDistData.map((st) => (
+                <div
+                  key={`overview-${st.name}`}
+                  className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/50 p-3.5"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ backgroundColor: STATUS_COLORS[st.name] }}
+                      />
+                      <span className={`text-xs font-semibold truncate ${STATUS_TEXT_CLASSES[st.name]}`}>
+                        {st.name}
+                      </span>
+                    </div>
+                    <span className="font-mono text-xs font-bold text-slate-800 dark:text-slate-200 tabular-nums">
+                      {formatPct(st.pct)}
+                    </span>
+                  </div>
+                  <div className="mt-2 flex items-baseline justify-between gap-2">
+                    <span className="font-mono text-xl font-bold text-slate-900 dark:text-slate-100 tabular-nums">
+                      {st.value}
+                    </span>
+                    <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                      of {summary.totalActivities} PPAs
+                    </span>
+                  </div>
+                  <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-200/80 dark:bg-slate-800">
+                    <div
+                      className="h-full rounded-full transition-all"
+                      style={{
+                        width: `${Math.min(100, Math.max(0, st.pct))}%`,
+                        backgroundColor: STATUS_COLORS[st.name],
+                      }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Primary KPI Grid */}

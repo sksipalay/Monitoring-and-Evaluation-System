@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { MessageSquarePlus, Search, Trash2 } from 'lucide-react';
+import { Download, MessageSquarePlus, Search, Trash2 } from 'lucide-react';
 import {
   ActivityComputed,
   ImplementationStatus,
@@ -23,6 +23,14 @@ import {
 import { StatusBadge } from '../ui/StatusBadge';
 import { AccomplishmentProgress } from '../ui/AccomplishmentProgress';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
+import {
+  canAddEvaluationRemarks,
+  isAdminRole,
+  isOfficeScopedRole,
+} from '../../utils/rbac';
+import { buildAuditLog, dataService } from '../../services/dataService';
+import { buildCsvBlob, sanitizeCsvFileSegment } from '../../utils/csvExport';
+import { triggerBlobDownload } from '../../utils/excelService';
 
 interface MonitoringEvaluationModuleProps {
   programs: Program[];
@@ -32,6 +40,7 @@ interface MonitoringEvaluationModuleProps {
   currentUser: UserAccount;
   onAddRemark: (remark: RemarkLog) => Promise<void>;
   onDeleteRemark: (id: string) => Promise<void>;
+  onNotify?: (type: 'success' | 'error', msg: string) => void;
 }
 
 interface MergedPPAGroup {
@@ -65,10 +74,11 @@ export function MonitoringEvaluationModule({
   currentUser,
   onAddRemark,
   onDeleteRemark,
+  onNotify,
 }: MonitoringEvaluationModuleProps) {
-  const canAddRemarks =
-    currentUser.role === 'ADMINISTRATOR' || currentUser.role === 'ENCODER';
-  const canDeleteRemarks = currentUser.role === 'ADMINISTRATOR';
+  const canAddRemarks = canAddEvaluationRemarks(currentUser.role);
+  const canDeleteAnyRemark =
+    isAdminRole(currentUser.role) || isOfficeScopedRole(currentUser.role);
 
   const [search, setSearch] = useState('');
   const [selectedGroupKey, setSelectedGroupKey] = useState<string>('');
@@ -536,9 +546,83 @@ export function MonitoringEvaluationModule({
 
             {/* Monitoring Personnel Observations & Remarks Log */}
             <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
-              <h4 className="text-[15px] sm:text-base font-semibold text-slate-900 dark:text-slate-100">
-                Monitoring Personnel Observations &amp; Field Notes
-              </h4>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-[15px] sm:text-base font-semibold text-slate-900 dark:text-slate-100">
+                    Monitoring Personnel Observations &amp; Field Notes
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {activityRemarks.length}{' '}
+                    {activityRemarks.length === 1 ? 'observation' : 'observations'} logged for this activity
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={activityRemarks.length === 0}
+                  onClick={() => {
+                    if (!selectedActivity || activityRemarks.length === 0) return;
+                    const parentProgram = programMap.get(selectedActivity.programId);
+                    const sortedHistory = [...activityRemarks].sort((a, b) =>
+                      `${a.monitoringDate}-${a.createdAt}`.localeCompare(
+                        `${b.monitoringDate}-${b.createdAt}`
+                      )
+                    );
+                    const headers = [
+                      'Remark ID',
+                      'Reference Code',
+                      'Activity Description',
+                      'Program',
+                      'Fiscal Year',
+                      'Implementing Office',
+                      'Monitoring Date',
+                      'Author',
+                      'Role',
+                      'Observation',
+                      'Logged At',
+                    ];
+                    const rows = sortedHistory.map((rem) => [
+                      rem.id,
+                      selectedActivity.referenceNumber || '',
+                      selectedActivity.description,
+                      parentProgram?.title || '',
+                      selectedActivity.fiscalYear,
+                      selectedActivity.officeName,
+                      rem.monitoringDate,
+                      rem.authorName,
+                      rem.authorRole,
+                      rem.observation,
+                      rem.createdAt,
+                    ]);
+                    const blob = buildCsvBlob(headers, rows);
+                    const safeRef = sanitizeCsvFileSegment(
+                      selectedActivity.referenceNumber || selectedActivity.description
+                    );
+                    const dateStamp = new Date().toISOString().slice(0, 10);
+                    const fileName = `LGU-Bula-Remarks-${safeRef}-${dateStamp}.csv`;
+                    triggerBlobDownload(blob, fileName);
+                    const audit = buildAuditLog(
+                      currentUser,
+                      'EXPORT',
+                      'RemarkLog',
+                      selectedActivity.id,
+                      `Exported ${sortedHistory.length} M&E remarks for "${selectedActivity.description}" to CSV`,
+                      fileName
+                    );
+                    void dataService.logAudit(audit).catch(() => {});
+                    onNotify?.(
+                      'success',
+                      `Exported ${sortedHistory.length} remark${
+                        sortedHistory.length === 1 ? '' : 's'
+                      } to ${fileName}.`
+                    );
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
+                  title="Export full remarks history for this activity as CSV"
+                >
+                  <Download className="h-3.5 w-3.5 text-[#163A5F] dark:text-sky-400" aria-hidden="true" />
+                  <span>Export Remarks CSV</span>
+                </button>
+              </div>
 
               {canAddRemarks && (
                 <form onSubmit={handleCreateRemark} className="space-y-3 border-b border-slate-200 dark:border-slate-800 pb-4">
@@ -595,7 +679,9 @@ export function MonitoringEvaluationModule({
                           {rem.authorName} ({rem.authorRole}) · Date: {rem.monitoringDate}
                         </p>
                       </div>
-                      {canDeleteRemarks && (
+                      {(canDeleteAnyRemark ||
+                        (currentUser.role === 'EVALUATOR' &&
+                          rem.authorUid === currentUser.uid)) && (
                         <button
                           type="button"
                           onClick={() => setConfirmDeleteRemarkId(rem.id)}

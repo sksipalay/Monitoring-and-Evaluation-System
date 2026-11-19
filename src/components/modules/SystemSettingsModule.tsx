@@ -3,6 +3,7 @@ import {
   BarChart3,
   Building2,
   Calendar,
+  CheckCircle2,
   Database,
   Download,
   Edit3,
@@ -14,6 +15,7 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  Shield,
   ShieldCheck,
   Sun,
   Trash2,
@@ -30,7 +32,8 @@ import {
 } from '../../types/ppa';
 import { dataService } from '../../services/dataService';
 import { useModalFocusTrap } from '../../hooks/useModalFocusTrap';
-import { DEFAULT_APP_NAME } from '../../utils/demoSeedData';
+import { DEFAULT_APP_NAME, DEFAULT_PRIVACY_NOTICE } from '../../utils/demoSeedData';
+import { isAdminRole } from '../../utils/rbac';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 
 interface SystemSettingsModuleProps {
@@ -42,6 +45,7 @@ interface SystemSettingsModuleProps {
   onChangeTheme: (nextTheme: 'light' | 'dark') => void;
   firebaseConfigured: boolean;
   firebaseProjectId: string | null;
+  demoSeedAllowed?: boolean;
   onSaveSettings: (s: SystemSettings) => Promise<void>;
   onCreateOffice: (o: Office) => Promise<void>;
   onUpdateOffice: (o: Office) => Promise<void>;
@@ -63,6 +67,7 @@ export function SystemSettingsModule({
   onChangeTheme,
   firebaseConfigured,
   firebaseProjectId,
+  demoSeedAllowed = false,
   onSaveSettings,
   onCreateOffice,
   onUpdateOffice,
@@ -74,11 +79,17 @@ export function SystemSettingsModule({
   onRestoreDatabase,
   onNotify,
 }: SystemSettingsModuleProps) {
-  const isAdmin = currentUser.role === 'ADMINISTRATOR';
+  const isAdmin = isAdminRole(currentUser.role);
   const [form, setForm] = useState<SystemSettings>({
     ...settings,
     appName: settings.appName || DEFAULT_APP_NAME,
     appLogoDataUrl: settings.appLogoDataUrl || '',
+    allowSelfRegistration: Boolean(settings.allowSelfRegistration),
+    sessionTimeoutMinutes: settings.sessionTimeoutMinutes ?? 30,
+    autoBackupEnabled: settings.autoBackupEnabled ?? true,
+    autoBackupIntervalHours: settings.autoBackupIntervalHours ?? 24,
+    backupRetentionCount: settings.backupRetentionCount ?? 15,
+    privacyNoticeText: settings.privacyNoticeText || DEFAULT_PRIVACY_NOTICE,
     theme,
   });
   const [newOffice, setNewOffice] = useState({ code: '', name: '', headName: '' });
@@ -102,6 +113,7 @@ export function SystemSettingsModule({
     snapshot: unknown;
   } | null>(null);
   const [restoringBackup, setRestoringBackup] = useState(false);
+  const [verifyingBackupName, setVerifyingBackupName] = useState<string | null>(null);
   const logoInputRef = useRef<HTMLInputElement | null>(null);
   const restoreInputRef = useRef<HTMLInputElement | null>(null);
   const editOfficeModalRef = useModalFocusTrap<HTMLDivElement>(
@@ -114,6 +126,12 @@ export function SystemSettingsModule({
       ...settings,
       appName: settings.appName || DEFAULT_APP_NAME,
       appLogoDataUrl: settings.appLogoDataUrl || '',
+      allowSelfRegistration: Boolean(settings.allowSelfRegistration),
+      sessionTimeoutMinutes: settings.sessionTimeoutMinutes ?? 30,
+      autoBackupEnabled: settings.autoBackupEnabled ?? true,
+      autoBackupIntervalHours: settings.autoBackupIntervalHours ?? 24,
+      backupRetentionCount: settings.backupRetentionCount ?? 15,
+      privacyNoticeText: settings.privacyNoticeText || DEFAULT_PRIVACY_NOTICE,
       theme,
     });
   }, [settings, theme]);
@@ -225,6 +243,22 @@ export function SystemSettingsModule({
       onNotify('error', err instanceof Error ? err.message : 'Failed to create snapshot backup.');
     } finally {
       setCreatingBackup(false);
+    }
+  };
+
+  const handleVerifyBackup = async (fileName: string) => {
+    if (!isAdmin) return;
+    setVerifyingBackupName(fileName);
+    try {
+      const res = await dataService.verifyBackup(fileName);
+      setBackups((prev) =>
+        prev.map((b) => (b.fileName === fileName ? { ...b, verified: res.valid } : b))
+      );
+      onNotify(res.valid ? 'success' : 'error', res.message);
+    } catch (err) {
+      onNotify('error', err instanceof Error ? err.message : 'Failed to verify snapshot integrity.');
+    } finally {
+      setVerifyingBackupName(null);
     }
   };
 
@@ -737,6 +771,114 @@ export function SystemSettingsModule({
           </div>
         </div>
 
+        {/* Security, Session, Automated Backup & RA 10173 Data Privacy Policy */}
+        <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-4">
+          <div className="flex items-center gap-2">
+            <Shield className="h-4 w-4 text-[#163A5F] dark:text-sky-400" />
+            <h4 className="text-xs font-bold text-slate-900 dark:text-slate-100">
+              Security Policy, Session Timeout, Backup Retention &amp; RA 10173 Privacy Notice
+            </h4>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                Idle Session Timeout (Minutes)
+              </label>
+              <input
+                disabled={!isAdmin}
+                type="number"
+                min={5}
+                max={480}
+                value={form.sessionTimeoutMinutes ?? 30}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    sessionTimeoutMinutes: Math.max(5, Math.min(480, Number(e.target.value) || 30)),
+                  })
+                }
+                className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:bg-slate-50 dark:disabled:bg-slate-800/60"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                Auto-Backup Interval (Hours)
+              </label>
+              <input
+                disabled={!isAdmin || !form.autoBackupEnabled}
+                type="number"
+                min={1}
+                max={168}
+                value={form.autoBackupIntervalHours ?? 24}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    autoBackupIntervalHours: Math.max(1, Math.min(168, Number(e.target.value) || 24)),
+                  })
+                }
+                className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:bg-slate-50 dark:disabled:bg-slate-800/60"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                Snapshot Retention Count
+              </label>
+              <input
+                disabled={!isAdmin}
+                type="number"
+                min={3}
+                max={100}
+                value={form.backupRetentionCount ?? 15}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    backupRetentionCount: Math.max(3, Math.min(100, Number(e.target.value) || 15)),
+                  })
+                }
+                className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:bg-slate-50 dark:disabled:bg-slate-800/60"
+              />
+            </div>
+
+            <div className="flex flex-col justify-center gap-2 pt-2 text-xs text-slate-700 dark:text-slate-300">
+              <label className="inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  disabled={!isAdmin}
+                  type="checkbox"
+                  checked={Boolean(form.allowSelfRegistration)}
+                  onChange={(e) => setForm({ ...form, allowSelfRegistration: e.target.checked })}
+                  className="rounded border-slate-300 dark:border-slate-600 text-[#2563EB]"
+                />
+                <span>Allow Self-Registration (Admin Approval)</span>
+              </label>
+              <label className="inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  disabled={!isAdmin}
+                  type="checkbox"
+                  checked={form.autoBackupEnabled ?? true}
+                  onChange={(e) => setForm({ ...form, autoBackupEnabled: e.target.checked })}
+                  className="rounded border-slate-300 dark:border-slate-600 text-[#2563EB]"
+                />
+                <span>Enable Scheduled Automated Backups</span>
+              </label>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+              Data Privacy Notice Text (RA 10173 — Shown at Sign-In / Registration)
+            </label>
+            <textarea
+              disabled={!isAdmin}
+              rows={3}
+              value={form.privacyNoticeText ?? ''}
+              onChange={(e) => setForm({ ...form, privacyNoticeText: e.target.value })}
+              className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:bg-slate-50 dark:disabled:bg-slate-800/60"
+            />
+          </div>
+        </div>
+
         {/* Firebase Configuration Section */}
         <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2">
           <div className="flex items-center gap-2">
@@ -909,13 +1051,15 @@ export function SystemSettingsModule({
               <div className="space-y-2">
                 <h4 className="text-xs font-bold text-slate-800 dark:text-slate-200">Database Maintenance</h4>
                 <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={onLoadSampleData}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
-                  >
-                    <Database className="h-3.5 w-3.5" /> Load Sample LGU Bula Dataset
-                  </button>
+                  {demoSeedAllowed && (
+                    <button
+                      type="button"
+                      onClick={onLoadSampleData}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                    >
+                      <Database className="h-3.5 w-3.5" /> Load Sample LGU Bula Dataset
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setConfirmReset(true)}
@@ -975,35 +1119,60 @@ export function SystemSettingsModule({
 
                 {backups.length === 0 ? (
                   <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                    No manual snapshots saved yet. Click &ldquo;Create Snapshot&rdquo; to save a downloadable JSON recovery point.
+                    No snapshots saved yet. Click &ldquo;Create Snapshot&rdquo; to save a SHA-256 verified JSON recovery point.
                   </p>
                 ) : (
-                  <div className="divide-y divide-slate-100 dark:divide-slate-800 rounded-lg border border-slate-200 dark:border-slate-800 max-h-40 overflow-y-auto text-[11px]">
-                    {backups.slice(0, 8).map((b) => (
-                      <div key={b.fileName} className="px-3 py-2 flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="font-mono font-medium text-slate-800 dark:text-slate-200 truncate">
-                            {b.fileName}
-                          </p>
+                  <div className="divide-y divide-slate-100 dark:divide-slate-800 rounded-lg border border-slate-200 dark:border-slate-800 max-h-56 overflow-y-auto text-[11px]">
+                    {backups.slice(0, 12).map((b) => (
+                      <div key={b.fileName} className="px-3 py-2 flex flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <p className="font-mono font-medium text-slate-800 dark:text-slate-200 truncate">
+                              {b.fileName}
+                            </p>
+                            {b.trigger && (
+                              <span className="rounded bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 text-[9.5px] font-mono font-semibold text-slate-600 dark:text-slate-300">
+                                {b.trigger}
+                              </span>
+                            )}
+                            {b.verified && (
+                              <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-400">
+                                <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                                Verified
+                              </span>
+                            )}
+                          </div>
                           <p className="text-slate-500 dark:text-slate-400">
                             {new Date(b.createdAt).toLocaleString('en-PH')} · {(b.sizeBytes / 1024).toFixed(1)} KB
+                            {b.sha256 ? ` · SHA-256:${b.sha256.slice(0, 10)}` : ''}
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            dataService.downloadBackup(b.fileName).catch((err) => {
-                              onNotify(
-                                'error',
-                                err instanceof Error ? err.message : 'Failed to download backup snapshot.'
-                              );
-                            });
-                          }}
-                          className="inline-flex items-center gap-1 rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-[11px] font-medium text-[#163A5F] dark:text-sky-400 hover:bg-slate-50 dark:hover:bg-slate-800 shrink-0"
-                        >
-                          <Download className="h-3 w-3" aria-hidden="true" />
-                          <span>Download</span>
-                        </button>
+                        <div className="inline-flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            disabled={verifyingBackupName === b.fileName}
+                            onClick={() => handleVerifyBackup(b.fileName)}
+                            className="inline-flex items-center gap-1 rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
+                          >
+                            <ShieldCheck className="h-3 w-3 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                            <span>{verifyingBackupName === b.fileName ? 'Checking...' : 'Verify'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              dataService.downloadBackup(b.fileName).catch((err) => {
+                                onNotify(
+                                  'error',
+                                  err instanceof Error ? err.message : 'Failed to download backup snapshot.'
+                                );
+                              });
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-[11px] font-medium text-[#163A5F] dark:text-sky-400 hover:bg-slate-50 dark:hover:bg-slate-800"
+                          >
+                            <Download className="h-3 w-3" aria-hidden="true" />
+                            <span>Download</span>
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>

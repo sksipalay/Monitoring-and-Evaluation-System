@@ -2,11 +2,16 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { Request, Response } from 'express';
-import type { Activity, AuditChangeDiff, Program } from '../src/types/ppa';
+import type { Activity, AuditChangeDiff, Program, SessionNetworkScope } from '../src/types/ppa';
 import { MONTHS } from '../src/utils/calculations';
 
 export const SESSION_COOKIE_NAME = 'bula_ppa_session';
-export const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
+const rawTtlHours = Number(process.env.SESSION_TTL_HOURS || 8);
+export const SESSION_TTL_MS =
+  (Number.isFinite(rawTtlHours) && rawTtlHours >= 1 && rawTtlHours <= 168 ? rawTtlHours : 8) *
+  60 *
+  60 *
+  1000;
 
 let cachedSessionSecret: string | null = null;
 
@@ -35,8 +40,27 @@ export function getSessionSecret(dataDir: string): string {
   return cachedSessionSecret;
 }
 
-// Scrypt Passcode Hashing
+// Scrypt Password / Passcode Hashing & Policy
 const SCRYPT_PREFIX = 'scrypt$';
+
+export function validatePasswordStrength(
+  candidate: string
+): { ok: true; value: string } | { ok: false; error: string } {
+  const trimmed = candidate.trim();
+  if (trimmed.length < 8) {
+    return { ok: false, error: 'Password must be at least 8 characters long.' };
+  }
+  if (trimmed.length > 128) {
+    return { ok: false, error: 'Password must not exceed 128 characters.' };
+  }
+  if (!/[A-Za-z]/.test(trimmed) || !/[0-9]/.test(trimmed)) {
+    return {
+      ok: false,
+      error: 'Password must include at least one letter and one number.',
+    };
+  }
+  return { ok: true, value: trimmed };
+}
 
 export function hashPasscode(passcode: string): string {
   const normalized = passcode.trim();
@@ -50,9 +74,9 @@ export function isHashedPasscode(stored?: string | null): boolean {
 }
 
 export function verifyPasscode(candidate: string, storedHash?: string | null): boolean {
-  if (!storedHash) return true;
+  // Never permit passwordless authentication bypass
+  if (!storedHash || !candidate) return false;
   if (!isHashedPasscode(storedHash)) {
-    // Fallback for any unmigrated literal value, constant-time compare
     const a = Buffer.from(candidate);
     const b = Buffer.from(storedHash);
     if (a.length !== b.length) return false;
@@ -70,6 +94,82 @@ export function verifyPasscode(candidate: string, storedHash?: string | null): b
   } catch {
     return false;
   }
+}
+
+export function generateResetToken(): string {
+  const raw = crypto.randomBytes(9).toString('hex').toUpperCase();
+  return `BULA-${raw.slice(0, 6)}-${raw.slice(6, 12)}-${raw.slice(12, 18)}`;
+}
+
+export function hashToken(token: string): string {
+  return crypto.createHash('sha256').update(token.trim(), 'utf8').digest('hex');
+}
+
+export function computeSha256(content: string | Buffer): string {
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+export function isOriginAllowed(req: Request): boolean {
+  const originHeader = req.headers.origin;
+  const refererHeader = req.headers.referer;
+  const candidate =
+    typeof originHeader === 'string' && originHeader.trim()
+      ? originHeader.trim()
+      : typeof refererHeader === 'string' && refererHeader.trim()
+        ? refererHeader.trim()
+        : '';
+
+  if (!candidate) {
+    // Non-browser API clients (curl, server health checks, Bearer CLI) have no Origin/Referer
+    return true;
+  }
+
+  let parsedOrigin: URL;
+  try {
+    parsedOrigin = new URL(candidate);
+  } catch {
+    return false;
+  }
+
+  const reqHost = (req.headers['x-forwarded-host'] || req.headers.host || '')
+    .toString()
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+
+  if (reqHost && parsedOrigin.host.toLowerCase() === reqHost) {
+    return true;
+  }
+
+  const configured = (process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (configured.includes(parsedOrigin.origin.toLowerCase())) {
+    return true;
+  }
+
+  // Allow AI Studio / preview iframe host or localhost variants on same host
+  if (
+    parsedOrigin.hostname === 'localhost' ||
+    parsedOrigin.hostname === '127.0.0.1'
+  ) {
+    return !reqHost || reqHost.startsWith('localhost') || reqHost.startsWith('127.0.0.1');
+  }
+
+  return false;
+}
+
+export function sanitizeServerError(err: unknown): { status: number; message: string } {
+  const statusRaw = (err as { status?: unknown })?.status;
+  const status = typeof statusRaw === 'number' && statusRaw >= 400 && statusRaw < 600 ? statusRaw : 500;
+  if (status < 500 && err instanceof Error && err.message) {
+    return { status, message: err.message };
+  }
+  return {
+    status,
+    message: 'An internal server error occurred while processing the request.',
+  };
 }
 
 // Signed Session Cookie Helpers
@@ -166,6 +266,132 @@ export function getClientIp(req: Request): string {
     return forwarded.split(',')[0].trim().slice(0, 64);
   }
   return (req.ip || req.socket?.remoteAddress || 'unknown').slice(0, 64);
+}
+
+function normalizeHeaderText(val: unknown): string {
+  if (typeof val !== 'string') return '';
+  return val.replace(/[^\w\s,.-]/g, '').trim().slice(0, 48);
+}
+
+export function getClientGeoHint(req: Request): string {
+  const city =
+    normalizeHeaderText(req.headers['x-appengine-city']) ||
+    normalizeHeaderText(req.headers['x-vercel-ip-city']);
+  const region =
+    normalizeHeaderText(req.headers['x-appengine-region']) ||
+    normalizeHeaderText(req.headers['x-vercel-ip-country-region']);
+  const country =
+    normalizeHeaderText(req.headers['cf-ipcountry']) ||
+    normalizeHeaderText(req.headers['x-appengine-country']) ||
+    normalizeHeaderText(req.headers['x-vercel-ip-country']);
+
+  const parts = [city, region, country].filter(
+    (p) => p && p.toUpperCase() !== 'ZZ' && p.toUpperCase() !== 'XX' && p !== '?'
+  );
+  return parts.join(', ').slice(0, 120);
+}
+
+export function classifyIpAndGeo(
+  rawIp: string,
+  geoHint = ''
+): {
+  ipAddress: string;
+  subnet: string;
+  locationLabel: string;
+  networkZone: string;
+  scope: SessionNetworkScope;
+} {
+  let ip = (rawIp || '').trim();
+  if (ip.toLowerCase().startsWith('::ffff:')) {
+    ip = ip.slice(7);
+  }
+  const cleanHint = geoHint.trim();
+
+  if (!ip || ip.toLowerCase() === 'unknown') {
+    return {
+      ipAddress: 'unknown',
+      subnet: 'unknown',
+      locationLabel: cleanHint || 'Unidentified Origin',
+      networkZone: 'Unknown Network',
+      scope: 'UNKNOWN',
+    };
+  }
+
+  // Loopback IPv4 (127.0.0.0/8) or IPv6 (::1)
+  if (ip === '::1' || ip.startsWith('127.')) {
+    return {
+      ipAddress: ip,
+      subnet: ip === '::1' ? '::1/128' : '127.0.0.0/8',
+      locationLabel: cleanHint || 'Local Host / Loopback',
+      networkZone: 'Localhost / Loopback',
+      scope: 'LOCAL',
+    };
+  }
+
+  // IPv4 classification
+  const ipv4Parts = ip.split('.').map((p) => Number(p));
+  if (
+    ipv4Parts.length === 4 &&
+    ipv4Parts.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)
+  ) {
+    const [a, b, c] = ipv4Parts;
+    const subnet = `${a}.${b}.${c}.0/24`;
+    const isRfc1918 =
+      a === 10 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168);
+    const isLinkLocal = a === 169 && b === 254;
+    const isCgnat = a === 100 && b >= 64 && b <= 127;
+
+    if (isRfc1918 || isLinkLocal) {
+      return {
+        ipAddress: ip,
+        subnet,
+        locationLabel: cleanHint || (isLinkLocal ? 'Link-Local LAN' : 'Private LGU Intranet (LAN)'),
+        networkZone: isLinkLocal ? 'Link-Local Network' : 'Private LGU Intranet (LAN)',
+        scope: 'PRIVATE',
+      };
+    }
+
+    if (isCgnat) {
+      return {
+        ipAddress: ip,
+        subnet,
+        locationLabel: cleanHint || `ISP Carrier-Grade NAT (${subnet})`,
+        networkZone: 'ISP Shared / CGNAT',
+        scope: 'PUBLIC',
+      };
+    }
+
+    return {
+      ipAddress: ip,
+      subnet,
+      locationLabel: cleanHint || `Public IPv4 Network (${subnet})`,
+      networkZone: cleanHint ? `Edge Geo: ${cleanHint}` : 'External / Public Network',
+      scope: 'PUBLIC',
+    };
+  }
+
+  // IPv6 classification
+  const lower = ip.toLowerCase();
+  const v6Prefix = lower.split(':').slice(0, 3).join(':') || lower;
+  if (lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80:')) {
+    return {
+      ipAddress: ip,
+      subnet: `${v6Prefix}::/48`,
+      locationLabel: cleanHint || 'Private IPv6 / Link-Local LAN',
+      networkZone: 'Private LGU Intranet (IPv6)',
+      scope: 'PRIVATE',
+    };
+  }
+
+  return {
+    ipAddress: ip,
+    subnet: `${v6Prefix}::/48`,
+    locationLabel: cleanHint || `Public IPv6 Network (${v6Prefix}::/48)`,
+    networkZone: cleanHint ? `Edge Geo: ${cleanHint}` : 'External / Public IPv6',
+    scope: 'PUBLIC',
+  };
 }
 
 // Tamper-Evident Audit Hash Chain
@@ -365,6 +591,22 @@ export function computeActivityDiff(before: Activity, after: Activity): AuditCha
   check('Remarks', before.remarks, after.remarks);
   check('Start Date', before.startDate || '', after.startDate || '');
   check('End Date', before.endDate || '', after.endDate || '');
+
+  const beforeMilestones = before.milestones || [];
+  const afterMilestones = after.milestones || [];
+  const beforeCompleted = beforeMilestones.filter((m) => m.status === 'Completed').length;
+  const afterCompleted = afterMilestones.filter((m) => m.status === 'Completed').length;
+  if (
+    beforeMilestones.length !== afterMilestones.length ||
+    beforeCompleted !== afterCompleted ||
+    JSON.stringify(beforeMilestones) !== JSON.stringify(afterMilestones)
+  ) {
+    check(
+      'Linked Tasks Progress',
+      `${beforeCompleted}/${beforeMilestones.length} Completed`,
+      `${afterCompleted}/${afterMilestones.length} Completed`
+    );
+  }
 
   for (const m of MONTHS) {
     const bm = before.monthly?.[m.key];

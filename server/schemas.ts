@@ -74,7 +74,29 @@ export const StatusEnum = z.enum([
   'NOT IMPLEMENTED',
 ]);
 
-export const RoleEnum = z.enum(['ADMINISTRATOR', 'ENCODER', 'VIEWER']);
+export const RoleEnum = z.enum([
+  'SUPER_ADMIN',
+  'ADMINISTRATOR',
+  'OFFICE_HEAD',
+  'ENCODER',
+  'EVALUATOR',
+  'VIEWER',
+]);
+
+export const ApprovalStatusEnum = z.enum(['APPROVED', 'PENDING', 'REJECTED']);
+
+export const SidebarModuleEnum = z.enum([
+  'dashboard',
+  'programs',
+  'budget',
+  'gad',
+  'status',
+  'evaluation',
+  'reports',
+  'excel',
+  'users',
+  'settings',
+]);
 
 export const BudgetClassEnum = z.enum([
   'GF',
@@ -105,12 +127,90 @@ export const BackupFileParamSchema = z.object({
 });
 
 export const AuditLogsQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(1000).optional().default(50),
+  limit: z.coerce.number().int().min(1).max(1000).optional(),
+  page: z.coerce.number().int().min(1).max(10_000).optional(),
+  pageSize: z.coerce.number().int().min(5).max(200).optional(),
+  action: z.string().trim().max(40).optional(),
+  search: z.string().trim().max(160).optional(),
 });
 
-export const LoginSchema = z.object({
-  userId: z.string().trim().min(1, 'Account ID is required.').max(120),
-  passcode: z.string().max(128).optional().default(''),
+export const LoginSchema = z
+  .object({
+    email: z.string().trim().email('Enter a valid account email address.').max(160).optional(),
+    userId: z.string().trim().min(1).max(120).optional(),
+    passcode: z.string().max(128).optional(),
+    password: z.string().max(128).optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (!data.email && !data.userId) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['email'],
+        message: 'Email address is required.',
+      });
+    }
+    const secret = (data.password ?? data.passcode ?? '').trim();
+    if (!secret) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['password'],
+        message: 'Password is required.',
+      });
+    }
+  });
+
+export const SetupAdminSchema = z.object({
+  email: z.string().trim().email('Enter a valid administrator email address.').max(160),
+  displayName: z.string().trim().min(2, 'Full name is required.').max(160),
+  position: z.string().trim().max(160).optional().default('MPDO System Administrator'),
+  password: z.string().min(8, 'Password must be at least 8 characters.').max(128),
+  privacyAccepted: z.literal(true, {
+    error: 'You must accept the Data Privacy Notice (RA 10173) to initialize the system.',
+  }),
+});
+
+export const RegisterSchema = z.object({
+  email: z.string().trim().email('Enter a valid email address.').max(160),
+  displayName: z.string().trim().min(2, 'Full name is required.').max(160),
+  officeId: z.string().trim().min(1, 'Implementing office is required.').max(120),
+  position: z.string().trim().min(2, 'Position / designation is required.').max(160),
+  password: z.string().min(8, 'Password must be at least 8 characters.').max(128),
+  privacyAccepted: z.literal(true, {
+    error: 'You must accept the Data Privacy Notice (RA 10173) to register.',
+  }),
+});
+
+export const ChangePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required.').max(128),
+  newPassword: z.string().min(8, 'New password must be at least 8 characters.').max(128),
+});
+
+export const ProfileUpdateSchema = z.object({
+  displayName: z.string().trim().min(2, 'Full name is required.').max(160),
+  position: z.string().trim().min(1, 'Position is required.').max(160),
+});
+
+export const ForgotPasswordRequestSchema = z.object({
+  email: z.string().trim().email('Enter a valid account email address.').max(160),
+});
+
+export const ResetPasswordConfirmSchema = z.object({
+  email: z.string().trim().email('Enter a valid account email address.').max(160),
+  token: z.string().trim().min(6, 'Reset token is required.').max(120),
+  newPassword: z.string().min(8, 'New password must be at least 8 characters.').max(128),
+});
+
+export const IssueResetTokenSchema = z.object({
+  expiresMinutes: z.coerce.number().int().min(5).max(1440).optional().default(60),
+  mustChangePassword: z.boolean().optional().default(false),
+});
+
+export const ApproveUserSchema = z.object({
+  approvalStatus: ApprovalStatusEnum,
+  role: RoleEnum.optional(),
+  officeId: z.string().trim().min(1).max(120).optional(),
+  isActive: z.boolean().optional(),
+  allowedModules: z.array(SidebarModuleEnum).max(20).optional(),
 });
 
 export const FirebaseLoginSchema = z.object({
@@ -149,6 +249,16 @@ export const ProgramSchema = z.object({
   updatedAt: z.string().max(64).optional(),
 });
 
+export const MilestoneStatusEnum = z.enum(['Pending', 'In Progress', 'Completed']);
+
+export const ActivityMilestoneSchema = z.object({
+  id: z.string().trim().min(1, 'Milestone ID is required.').max(120),
+  title: z.string().trim().min(1, 'Task / milestone title is required.').max(240),
+  status: MilestoneStatusEnum.default('Pending'),
+  dueDate: SafeDateString.optional().default(''),
+  completedAt: z.string().max(64).optional().default(''),
+});
+
 export const ActivitySchema = z
   .object({
     id: z.string().trim().min(1, 'Activity ID is required.').max(120),
@@ -175,6 +285,7 @@ export const ActivitySchema = z
     monthly: MonthlyMonitoringMapSchema,
     status: StatusEnum.default('PENDING'),
     remarks: z.string().max(4000).optional().default(''),
+    milestones: z.array(ActivityMilestoneSchema).max(100).optional().default([]),
     orderIndex: z.number().int().min(0).max(100_000).optional(),
     startDate: SafeDateString.optional().default(''),
     endDate: SafeDateString.optional().default(''),
@@ -254,6 +365,9 @@ export const UserSchema = z.object({
   passcode: z.string().max(128).optional(),
   clearPasscode: z.boolean().optional(),
   isActive: z.boolean().default(true),
+  approvalStatus: ApprovalStatusEnum.optional().default('APPROVED'),
+  mustChangePassword: z.boolean().optional().default(false),
+  allowedModules: z.array(SidebarModuleEnum).max(20).optional(),
   createdAt: z.string().max(64).optional(),
   updatedAt: z.string().max(64).optional(),
 });
@@ -273,6 +387,12 @@ export const SystemSettingsSchema = z.object({
   approvedByTitle: z.string().trim().max(160),
   firebaseWebConfigJson: z.string().max(8000).optional().default(''),
   theme: z.enum(['light', 'dark']).optional(),
+  allowSelfRegistration: z.boolean().optional(),
+  sessionTimeoutMinutes: z.coerce.number().int().min(5).max(480).optional(),
+  autoBackupEnabled: z.boolean().optional(),
+  autoBackupIntervalHours: z.coerce.number().int().min(1).max(720).optional(),
+  backupRetentionCount: z.coerce.number().int().min(1).max(100).optional(),
+  privacyNoticeText: z.string().trim().max(3000).optional(),
 });
 
 export const UploadedDocumentSchema = z.object({
@@ -303,8 +423,14 @@ export const ClientAuditLogSchema = z.object({
   details: z.string().max(1000).optional().default(''),
 });
 
-export const ProgramRequestSchema = z.object({ program: ProgramSchema });
-export const ActivityRequestSchema = z.object({ activity: ActivitySchema });
+export const ProgramRequestSchema = z.object({
+  program: ProgramSchema,
+  expectedUpdatedAt: z.string().max(64).optional(),
+});
+export const ActivityRequestSchema = z.object({
+  activity: ActivitySchema,
+  expectedUpdatedAt: z.string().max(64).optional(),
+});
 export const RemarkRequestSchema = z.object({ remark: RemarkSchema });
 export const OfficeRequestSchema = z.object({ office: OfficeSchema });
 export const FiscalYearRequestSchema = z.object({ fiscalYear: FiscalYearSchema });
@@ -327,6 +453,12 @@ export const RestoreBackupSchema = z.object({
         passcodeHash: z.string().max(500).nullable().optional(),
         passcode: z.string().max(128).nullable().optional(),
         isActive: z.boolean(),
+        approvalStatus: ApprovalStatusEnum.optional().default('APPROVED'),
+        mustChangePassword: z.boolean().optional().default(false),
+        allowedModules: z.array(SidebarModuleEnum).max(20).optional(),
+        lastLoginAt: z.string().max(64).optional(),
+        lastLoginIp: z.string().max(64).optional(),
+        privacyConsentAt: z.string().max(64).optional(),
         createdAt: z.string().max(64),
         updatedAt: z.string().max(64),
       })
@@ -350,3 +482,73 @@ export const RestoreBackupSchema = z.object({
     settings: SystemSettingsSchema,
   }),
 });
+
+export const TemplateFormatEnum = z.enum(['xlsx', 'docx', 'pdf']);
+
+export const TemplateReportTargetEnum = z.enum([
+  'all_reports',
+  'excel_monitoring',
+  'annual_ppa',
+  'monthly_accomplishment',
+  'physical_accomplishment',
+  'financial_accomplishment',
+  'budget_utilization',
+  'program_level',
+  'gad_compliance',
+  'completed_activities',
+  'pending_not_implemented',
+]);
+
+export const TemplateAnalysisSchema = z.object({
+  format: TemplateFormatEnum,
+  pageCountOrSheets: z.number().int().min(0).max(500),
+  sheetOrPageNames: z.array(z.string().max(160)).max(100).default([]),
+  paperSize: z.string().max(40).optional(),
+  orientation: z.enum(['portrait', 'landscape']).optional(),
+  detectedPlaceholders: z.array(z.string().max(120)).max(300).default([]),
+  detectedColumns: z.array(z.string().max(160)).max(200).default([]),
+  hasRowLoopTag: z.boolean().optional(),
+  hasAcroFormFields: z.boolean().optional(),
+  acroFormFields: z.array(z.string().max(160)).max(300).optional(),
+  detectedHeaderRow: z.number().int().min(0).max(500).optional(),
+  detectedSignatureSection: z.boolean().optional(),
+  detectedLogoOrImages: z.boolean().optional(),
+  warnings: z.array(z.string().max(400)).max(50).default([]),
+});
+
+export const CreateOrVersionTemplateSchema = z.object({
+  templateId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(120)
+    .regex(/^[A-Za-z0-9_.:-]+$/)
+    .optional(),
+  name: z.string().trim().min(2, 'Template name is required.').max(160),
+  description: z.string().trim().max(600).optional().default(''),
+  format: TemplateFormatEnum,
+  targetReport: TemplateReportTargetEnum.default('all_reports'),
+  isDefault: z.boolean().optional().default(false),
+  isActive: z.boolean().optional().default(true),
+  fileName: z.string().trim().min(1, 'Template file name is required.').max(260),
+  mimeType: z.string().trim().max(160).optional().default(''),
+  fileBase64: z.string().min(16, 'Template file content is empty.').max(14_000_000),
+  notes: z.string().trim().max(600).optional().default(''),
+  analysis: TemplateAnalysisSchema,
+});
+
+export const UpdateTemplateSchema = z.object({
+  name: z.string().trim().min(2, 'Template name is required.').max(160).optional(),
+  description: z.string().trim().max(600).optional(),
+  targetReport: TemplateReportTargetEnum.optional(),
+  isDefault: z.boolean().optional(),
+  isActive: z.boolean().optional(),
+  activeVersionId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(120)
+    .regex(/^[A-Za-z0-9_.:-]+$/)
+    .optional(),
+});
+

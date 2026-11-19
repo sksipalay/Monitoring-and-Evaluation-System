@@ -25,6 +25,7 @@ import {
 } from '../../utils/excelService';
 import { formatPHP } from '../../utils/calculations';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
+import { isAdminRole } from '../../utils/rbac';
 
 interface ExcelImportExportModuleProps {
   programs: Program[];
@@ -59,7 +60,7 @@ export function ExcelImportExportModule({
   onLogExport,
   onNotify,
 }: ExcelImportExportModuleProps) {
-  const canImport = currentUser.role === 'ADMINISTRATOR';
+  const canImport = isAdminRole(currentUser.role);
   const defaultFy =
     selectedFiscalYear === 'ALL' ? fiscalYears[0]?.year || '2026' : selectedFiscalYear;
 

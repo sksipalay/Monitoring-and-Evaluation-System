@@ -23,6 +23,7 @@ import {
   summarizeProgram,
 } from '../../utils/calculations';
 import { StatusBadge } from '../ui/StatusBadge';
+import { canEditStatusOrRemarks } from '../../utils/rbac';
 
 interface AccomplishmentStatusModuleProps {
   programs: Program[];
@@ -51,8 +52,10 @@ export function AccomplishmentStatusModule({
   programs,
   activities,
   selectedFiscalYear,
+  userRole,
   onUpdateStatus,
 }: AccomplishmentStatusModuleProps) {
+  const canEditRemarks = canEditStatusOrRemarks(userRole);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [remarksDrafts, setRemarksDrafts] = useState<Record<string, string>>({});
@@ -346,20 +349,24 @@ export function AccomplishmentStatusModule({
                             aria-label={`Remarks for ${act.referenceNumber}`}
                             rows={computeRemarksRows(draftValue)}
                             value={draftValue}
-                            disabled={isSaving}
+                            disabled={isSaving || !canEditRemarks}
                             onChange={(e) => handleRemarksChange(act.id, e.target.value)}
                             onBlur={(e) => {
-                              if (isDirty && !isSaving) {
+                              if (canEditRemarks && isDirty && !isSaving) {
                                 void handleSaveRemarks(act, e.currentTarget.value);
                               }
                             }}
                             onKeyDown={(e) => {
-                              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                              if (canEditRemarks && (e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                                 e.preventDefault();
                                 void handleSaveRemarks(act, e.currentTarget.value);
                               }
                             }}
-                            placeholder="Enter detailed multi-line accomplishment remarks or observations..."
+                            placeholder={
+                              canEditRemarks
+                                ? 'Enter detailed multi-line accomplishment remarks or observations...'
+                                : 'Read-only remarks'
+                            }
                             className={`no-print w-full resize-y rounded-lg border px-3 py-2 text-[13px] leading-relaxed whitespace-pre-wrap break-words text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none transition-colors ${
                               isDirty
                                 ? 'border-[#2563EB] bg-blue-50/30 dark:bg-sky-950/20'
@@ -369,7 +376,7 @@ export function AccomplishmentStatusModule({
                           <div className="hidden print:block text-[12px] leading-relaxed whitespace-pre-wrap break-words text-slate-800">
                             {draftValue.trim() || '—'}
                           </div>
-                          {(isDirty || isSaving || isSaved) && (
+                          {canEditRemarks && (isDirty || isSaving || isSaved) && (
                             <div className="no-print flex flex-wrap items-center justify-between gap-2">
                               <span className="text-[11px] text-slate-500 dark:text-slate-400">
                                 {isSaving
