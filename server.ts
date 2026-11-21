@@ -122,13 +122,28 @@ function sanitizeProgramInput(raw: Program): Program {
     ...raw,
     aipRefCode: sanitizeSpreadsheetText(raw.aipRefCode),
     title: sanitizeSpreadsheetText(raw.title),
+    targetOutputs: raw.targetOutputs ? sanitizeSpreadsheetText(raw.targetOutputs) : '',
     sector: sanitizeSpreadsheetText(raw.sector || 'General Public Services'),
     sourceOfFund: raw.sourceOfFund ? sanitizeSpreadsheetText(raw.sourceOfFund) : '',
+    status: raw.status || 'PENDING',
     officeName: sanitizeSpreadsheetText(raw.officeName),
+    supplementalLogs: Array.isArray(raw.supplementalLogs)
+      ? raw.supplementalLogs.map((log) => ({
+          ...log,
+          supplementalNumber:
+            typeof log.supplementalNumber === 'number' && Number.isFinite(log.supplementalNumber)
+              ? Math.max(1, Math.floor(log.supplementalNumber))
+              : undefined,
+          notes: log.notes ? sanitizeSpreadsheetText(log.notes) : undefined,
+        }))
+      : raw.supplementalLogs,
   };
 }
 
 function sanitizeActivityInput(raw: Activity): Activity {
+  const clampedCompletion = Math.round(
+    Math.min(100, Math.max(0, Number(raw.completionPct ?? 0))) * 100
+  ) / 100;
   return {
     ...raw,
     referenceNumber: sanitizeSpreadsheetText(raw.referenceNumber),
@@ -136,6 +151,7 @@ function sanitizeActivityInput(raw: Activity): Activity {
     targetOutputs: raw.targetOutputs ? sanitizeSpreadsheetText(raw.targetOutputs) : '',
     officeName: sanitizeSpreadsheetText(raw.officeName),
     sourceOfFund: raw.sourceOfFund ? sanitizeSpreadsheetText(raw.sourceOfFund) : '',
+    completionPct: Number.isFinite(clampedCompletion) ? clampedCompletion : 0,
     remarks: raw.remarks ? sanitizeSpreadsheetText(raw.remarks) : '',
     milestones: Array.isArray(raw.milestones)
       ? raw.milestones.map((m) => ({
@@ -145,6 +161,31 @@ function sanitizeActivityInput(raw: Activity): Activity {
           dueDate: m.dueDate || '',
           completedAt: m.completedAt || '',
         }))
+      : [],
+    evidence: Array.isArray(raw.evidence)
+      ? raw.evidence.map((ev) => {
+          let safeUrl = '';
+          const rawUrl = (ev.url || '').trim();
+          if (rawUrl) {
+            try {
+              const parsed = new URL(rawUrl);
+              if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                safeUrl = rawUrl;
+              }
+            } catch {
+              safeUrl = '';
+            }
+          }
+          return {
+            id: ev.id,
+            title: ev.title ? sanitizeSpreadsheetText(ev.title) : '',
+            note: ev.note ? sanitizeSpreadsheetText(ev.note) : '',
+            url: safeUrl,
+            addedByUid: ev.addedByUid || '',
+            addedByName: ev.addedByName ? sanitizeSpreadsheetText(ev.addedByName) : '',
+            addedAt: ev.addedAt || new Date().toISOString(),
+          };
+        })
       : [],
   };
 }
@@ -178,6 +219,9 @@ function getEvaluatorLockedFieldChanges(existing: Activity, clean: Activity): st
   if (JSON.stringify(existing.milestones || []) !== JSON.stringify(clean.milestones || [])) {
     locked.push('milestones');
   }
+  if (JSON.stringify(existing.evidence || []) !== JSON.stringify(clean.evidence || [])) {
+    locked.push('evidence');
+  }
   if (clean.orderIndex !== undefined && clean.orderIndex !== existing.orderIndex) {
     locked.push('orderIndex');
   }
@@ -196,6 +240,26 @@ function getEvaluatorLockedFieldChanges(existing: Activity, clean: Activity): st
     ) {
       locked.push(`monthly.${m.key}`);
     }
+  }
+  return locked;
+}
+
+function getEvaluatorProgramLockedFieldChanges(existing: Program, clean: Program): string[] {
+  const locked: string[] = [];
+  if (existing.fiscalYear !== clean.fiscalYear) locked.push('fiscalYear');
+  if (existing.aipRefCode !== clean.aipRefCode) locked.push('aipRefCode');
+  if (existing.title !== clean.title) locked.push('title');
+  if ((existing.targetOutputs || '') !== (clean.targetOutputs || '')) locked.push('targetOutputs');
+  if (existing.sector !== clean.sector) locked.push('sector');
+  if ((existing.budget ?? 0) !== (clean.budget ?? 0)) locked.push('budget');
+  if ((existing.supplementalBudget ?? 0) !== (clean.supplementalBudget ?? 0)) {
+    locked.push('supplementalBudget');
+  }
+  if ((existing.sourceOfFund || '') !== (clean.sourceOfFund || '')) locked.push('sourceOfFund');
+  if (Boolean(existing.gadFund) !== Boolean(clean.gadFund)) locked.push('gadFund');
+  if (existing.officeId !== clean.officeId) locked.push('officeId');
+  if ((existing.parentProgramId ?? null) !== (clean.parentProgramId ?? null)) {
+    locked.push('parentProgramId');
   }
   return locked;
 }
@@ -1054,8 +1118,7 @@ async function startServer() {
   app.put(
     '/api/programs/:id',
     requireAuth,
-    requireModule('programs'),
-    requireRoles('SUPER_ADMIN', 'ADMINISTRATOR', 'OFFICE_HEAD', 'ENCODER'),
+    requireRoles('SUPER_ADMIN', 'ADMINISTRATOR', 'OFFICE_HEAD', 'ENCODER', 'EVALUATOR'),
     (req: AuthenticatedRequest, res) => {
       const actingUser = req.authUser!;
       const paramParsed = IdParamSchema.safeParse(req.params);
@@ -1084,28 +1147,59 @@ async function startServer() {
       }
 
       const clean = sanitizeProgramInput(parsed.data.program as Program);
-      const updated: Program = {
-        ...existing,
-        ...clean,
-        id: existing.id,
-        officeId: isOfficeScopedRole(actingUser.role) ? actingUser.officeId : clean.officeId,
-        officeName: isOfficeScopedRole(actingUser.role) ? actingUser.officeName : clean.officeName,
-        createdAt: existing.createdAt,
-        updatedAt: new Date().toISOString(),
-      };
+      let updated: Program;
+
+      if (actingUser.role === 'EVALUATOR') {
+        if (!hasModuleAccess(actingUser, 'status') && !hasModuleAccess(actingUser, 'evaluation')) {
+          res.status(403).json({ error: 'Evaluator does not have Accomplishment Status module access.' });
+          return;
+        }
+        const lockedChanges = getEvaluatorProgramLockedFieldChanges(existing, clean);
+        if (lockedChanges.length > 0) {
+          res.status(403).json({
+            error: `Access denied: Evaluators can only update program accomplishment status. Locked field(s): ${lockedChanges.slice(0, 5).join(', ')}`,
+          });
+          return;
+        }
+        updated = {
+          ...existing,
+          status: clean.status || existing.status || 'PENDING',
+          updatedAt: new Date().toISOString(),
+        };
+      } else {
+        if (!hasModuleAccess(actingUser, 'programs') && !hasModuleAccess(actingUser, 'status')) {
+          res.status(403).json({ error: 'Missing required module permission to update program.' });
+          return;
+        }
+        updated = {
+          ...existing,
+          ...clean,
+          id: existing.id,
+          status: clean.status || existing.status || 'PENDING',
+          officeId: isOfficeScopedRole(actingUser.role) ? actingUser.officeId : clean.officeId,
+          officeName: isOfficeScopedRole(actingUser.role) ? actingUser.officeName : clean.officeName,
+          createdAt: existing.createdAt,
+          updatedAt: new Date().toISOString(),
+        };
+      }
 
       const diffs = computeProgramDiff(existing, updated);
       const suppChanged = (existing.supplementalBudget ?? 0) !== (updated.supplementalBudget ?? 0);
+      const statusChanged = (existing.status || 'PENDING') !== (updated.status || 'PENDING');
+      const auditAction: AuditActionType =
+        statusChanged && !suppChanged && diffs.length === 1 ? 'STATUS_CHANGE' : 'UPDATE';
       const auditLog = database.updateProgram(
         updated,
         makeServerAuditEntry(
           actingUser,
-          'UPDATE',
+          auditAction,
           'Program',
           updated.id,
           suppChanged
             ? `Adjusted supplemental budget for ${updated.aipRefCode}: ${updated.title}`
-            : `Updated program ${updated.aipRefCode}: ${updated.title}`,
+            : statusChanged
+              ? `Changed accomplishment status of program ${updated.aipRefCode} from ${existing.status || 'PENDING'} to ${updated.status || 'PENDING'}`
+              : `Updated program ${updated.aipRefCode}: ${updated.title}`,
           diffs.map((d) => `${d.field}: ${d.before} → ${d.after}`).join(' | '),
           diffs
         ),
@@ -1182,6 +1276,14 @@ async function startServer() {
         return;
       }
 
+      const parentProg = database.getProgramById(clean.programId);
+      if (parentProg) {
+        clean.status = parentProg.status || clean.status || 'PENDING';
+        if (parentProg.sourceOfFund) {
+          clean.sourceOfFund = parentProg.sourceOfFund;
+        }
+      }
+
       const now = new Date().toISOString();
       clean.createdBy = actingUser.uid;
       clean.updatedBy = actingUser.uid;
@@ -1245,13 +1347,14 @@ async function startServer() {
         const lockedChanges = getEvaluatorLockedFieldChanges(existing, clean);
         if (lockedChanges.length > 0) {
           res.status(403).json({
-            error: `Access denied: Evaluators can only update implementation status and evaluation remarks. Locked field(s): ${lockedChanges.slice(0, 5).join(', ')}`,
+            error: `Access denied: Evaluators can only update implementation status, completion percentage, and evaluation remarks. Locked field(s): ${lockedChanges.slice(0, 5).join(', ')}`,
           });
           return;
         }
         updated = {
           ...existing,
           status: clean.status,
+          completionPct: clean.completionPct ?? existing.completionPct ?? 0,
           remarks: clean.remarks,
           updatedBy: actingUser.uid,
           updatedAt: new Date().toISOString(),
@@ -1339,7 +1442,7 @@ async function startServer() {
         )
       );
 
-      res.json({ ok: true, auditLog });
+      res.json({ ok: true, updatedAt: now, auditLog });
     }
   );
 
@@ -2201,12 +2304,22 @@ async function startServer() {
       allowedUids.add(actingUser.uid);
     }
 
-    if (queryParsed.data.page !== undefined || queryParsed.data.pageSize !== undefined) {
+    if (
+      queryParsed.data.page !== undefined ||
+      queryParsed.data.pageSize !== undefined ||
+      queryParsed.data.userUid !== undefined ||
+      queryParsed.data.dateFrom !== undefined ||
+      queryParsed.data.dateTo !== undefined
+    ) {
       const paginated = database.getAuditLogsPaginated({
         page: queryParsed.data.page,
         pageSize: queryParsed.data.pageSize,
         action: queryParsed.data.action,
         search: queryParsed.data.search,
+        userUid: queryParsed.data.userUid,
+        dateFrom: queryParsed.data.dateFrom,
+        dateTo: queryParsed.data.dateTo,
+        tzOffsetMinutes: queryParsed.data.tzOffsetMinutes,
         allowedUids,
       });
       res.json(paginated);

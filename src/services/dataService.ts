@@ -388,7 +388,7 @@ export const dataService = {
   },
 
   reorderActivities(updates: { id: string; orderIndex: number }[], auditLog: AuditLog) {
-    return apiRequest<{ ok: boolean; auditLog?: AuditLog }>('/api/activities/reorder', {
+    return apiRequest<{ ok: boolean; updatedAt?: string; auditLog?: AuditLog }>('/api/activities/reorder', {
       method: 'POST',
       body: JSON.stringify({ updates, auditLog }),
     });
@@ -562,12 +562,22 @@ export const dataService = {
     pageSize?: number;
     action?: string;
     search?: string;
+    userUid?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    tzOffsetMinutes?: number;
   }) {
     const query = new URLSearchParams();
     if (params.page) query.set('page', String(params.page));
     if (params.pageSize) query.set('pageSize', String(params.pageSize));
     if (params.action && params.action !== 'ALL') query.set('action', params.action);
     if (params.search && params.search.trim()) query.set('search', params.search.trim());
+    if (params.userUid && params.userUid !== 'ALL') query.set('userUid', params.userUid);
+    if (params.dateFrom && params.dateFrom.trim()) query.set('dateFrom', params.dateFrom.trim());
+    if (params.dateTo && params.dateTo.trim()) query.set('dateTo', params.dateTo.trim());
+    if (typeof params.tzOffsetMinutes === 'number' && Number.isFinite(params.tzOffsetMinutes)) {
+      query.set('tzOffsetMinutes', String(params.tzOffsetMinutes));
+    }
     return apiRequest<PaginatedAuditLogsResponse>(`/api/audit-logs?${query.toString()}`);
   },
 

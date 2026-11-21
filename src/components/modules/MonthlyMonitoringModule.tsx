@@ -269,7 +269,7 @@ export function MonthlyMonitoringModule({
                         </td>
                         <td className="py-2.5 px-3">
                           <div className="flex flex-wrap items-center gap-1.5">
-                            <StatusBadge status={act.status} compact />
+                            <StatusBadge status={programMap.get(act.programId)?.status || act.status} compact />
                             {resolveActivityBudgetDisplay(
                               act,
                               programMap.get(act.programId),

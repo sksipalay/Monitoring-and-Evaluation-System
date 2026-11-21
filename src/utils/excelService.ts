@@ -16,12 +16,17 @@ import {
 import {
   MONTHS,
   calculateRevisedBudgetByFund,
+  classifyFundBucket,
   computeActivityMetrics,
+  computeDashboardSummary,
   computeGadComplianceSummary,
   createEmptyMonthlyData,
+  getProgramSupplementalBreakdown,
   isPersonnelServicesFund,
+  resolveActivityBudgetDisplay,
   round2,
   safeNum,
+  sumMonthlyPhysicalTargets,
   summarizeProgram,
 } from './calculations';
 import {
@@ -427,10 +432,51 @@ export async function populateOfficialExcelTemplate(options: {
 
       // Build unified numeric/text dataset matching reportType
       const progById = new Map(fyPrograms.map((p) => [p.id, p]));
+      const progSumMap = new Map(
+        fyPrograms.map((p) => [p.id, summarizeProgram(p, computedList)])
+      );
+      const dashSummary = computeDashboardSummary(fyPrograms, computedList);
       const gadSummary =
         reportType === 'gad_compliance'
           ? computeGadComplianceSummary(fyPrograms, computedList)
           : null;
+
+      const buildProgramMonthlyMap = (
+        prog: Program,
+        progActs: ActivityComputed[]
+      ): MonthlyMonitoringMap => {
+        const out = createEmptyMonthlyData();
+        const hasProgTargets = sumMonthlyPhysicalTargets(prog.monthlyPhysicalTarget) > 0;
+        for (const m of MONTHS) {
+          let pt = 0;
+          let ft = 0;
+          let pa = 0;
+          let fa = 0;
+          for (const a of progActs) {
+            pt += safeNum(a.monthly[m.key].physicalTarget);
+            ft += safeNum(a.monthly[m.key].financialTarget);
+            pa += safeNum(a.monthly[m.key].physicalActual);
+            fa += safeNum(a.monthly[m.key].financialActual);
+          }
+          out[m.key] = {
+            physicalTarget: hasProgTargets
+              ? Math.max(0, safeNum(prog.monthlyPhysicalTarget?.[m.key]))
+              : Math.round(pt * 10000) / 10000,
+            financialTarget: round2(ft),
+            physicalActual: Math.round(pa * 10000) / 10000,
+            financialActual: round2(fa),
+          };
+        }
+        return out;
+      };
+
+      const actCountByProgram = new Map<string, number>();
+      for (const act of computedList) {
+        actCountByProgram.set(act.programId, (actCountByProgram.get(act.programId) || 0) + 1);
+      }
+
+      let hasSharedProgBudget = false;
+      let hasSharedProgTargets = false;
 
       interface UnifiedExcelRow {
         ref: string;
@@ -468,7 +514,21 @@ export async function populateOfficialExcelTemplate(options: {
       const unifiedRows: UnifiedExcelRow[] =
         reportType === 'program_level'
           ? fyPrograms.map((p) => {
-              const s = summarizeProgram(p, computedList);
+              const s = progSumMap.get(p.id) || summarizeProgram(p, computedList);
+              const progActs = computedList.filter(
+                (a) => a.programId === p.id || a.subprogramId === p.id
+              );
+              const pBreakdown = getProgramSupplementalBreakdown(p);
+              const pActSupp1 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget1, 0));
+              const pActSupp2 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget2, 0));
+              const pActSupp3 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget3, 0));
+              const pActSupp4 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget4, 0));
+              const pActSupp5 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget5, 0));
+              const extraSlotsSum = round2(
+                pBreakdown.orderedSlots
+                  .filter((slot) => slot.slotNumber > 5)
+                  .reduce((sum, slot) => sum + slot.amount, 0)
+              );
               return {
                 ref: p.aipRefCode,
                 description: p.title,
@@ -476,18 +536,18 @@ export async function populateOfficialExcelTemplate(options: {
                 targetOutputs: s.activityCount,
                 office: p.officeName,
                 sourceOfFund: p.sourceOfFund || '',
-                classification: p.sourceOfFund || '',
+                classification: p.sourceOfFund ? classifyFundBucket(p.sourceOfFund) : '',
                 gf: s.gf,
                 ps: s.ps,
                 mooe: s.mooe,
                 co: s.co,
                 approved: s.approvedBudget,
                 withheld: s.withheldAmount,
-                supp1: s.totalSupplemental,
-                supp2: 0,
-                supp3: 0,
-                supp4: 0,
-                supp5: 0,
+                supp1: round2(pActSupp1 + (pBreakdown.byNumber[1] || 0)),
+                supp2: round2(pActSupp2 + (pBreakdown.byNumber[2] || 0)),
+                supp3: round2(pActSupp3 + (pBreakdown.byNumber[3] || 0)),
+                supp4: round2(pActSupp4 + (pBreakdown.byNumber[4] || 0)),
+                supp5: round2(pActSupp5 + (pBreakdown.byNumber[5] || 0) + extraSlotsSum),
                 revised: s.revisedBudget,
                 annPT: s.annualPhysicalTarget,
                 annPA: s.annualPhysicalActual,
@@ -497,8 +557,9 @@ export async function populateOfficialExcelTemplate(options: {
                 finPct: s.financialAccomplishmentPct,
                 remaining: s.remainingBudget,
                 utilPct: s.budgetUtilizationPct,
-                status: s.budgetUtilizationPct >= 100 ? 'COMPLETED' : 'ON-GOING',
+                status: p.status || 'PENDING',
                 remarks: '',
+                monthly: buildProgramMonthlyMap(p, progActs),
               };
             })
           : reportType === 'gad_compliance' && gadSummary
@@ -507,6 +568,20 @@ export async function populateOfficialExcelTemplate(options: {
                   gadSummary.totalBudgetApproved > 0
                     ? round2((s.approvedBudget / gadSummary.totalBudgetApproved) * 100)
                     : 0;
+                const progActs = computedList.filter(
+                  (a) => a.programId === s.program.id || a.subprogramId === s.program.id
+                );
+                const pBreakdown = getProgramSupplementalBreakdown(s.program);
+                const pActSupp1 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget1, 0));
+                const pActSupp2 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget2, 0));
+                const pActSupp3 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget3, 0));
+                const pActSupp4 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget4, 0));
+                const pActSupp5 = round2(progActs.reduce((sum, a) => sum + a.supplementalBudget5, 0));
+                const extraSlotsSum = round2(
+                  pBreakdown.orderedSlots
+                    .filter((slot) => slot.slotNumber > 5)
+                    .reduce((sum, slot) => sum + slot.amount, 0)
+                );
                 return {
                   ref: s.program.aipRefCode,
                   description: s.program.title,
@@ -514,18 +589,20 @@ export async function populateOfficialExcelTemplate(options: {
                   targetOutputs: s.activityCount,
                   office: s.program.officeName,
                   sourceOfFund: s.program.sourceOfFund || '',
-                  classification: s.program.sourceOfFund || '',
+                  classification: s.program.sourceOfFund
+                    ? classifyFundBucket(s.program.sourceOfFund)
+                    : '',
                   gf: s.gf,
                   ps: s.ps,
                   mooe: s.mooe,
                   co: s.co,
                   approved: s.approvedBudget,
                   withheld: s.withheldAmount,
-                  supp1: s.totalSupplemental,
-                  supp2: 0,
-                  supp3: 0,
-                  supp4: 0,
-                  supp5: 0,
+                  supp1: round2(pActSupp1 + (pBreakdown.byNumber[1] || 0)),
+                  supp2: round2(pActSupp2 + (pBreakdown.byNumber[2] || 0)),
+                  supp3: round2(pActSupp3 + (pBreakdown.byNumber[3] || 0)),
+                  supp4: round2(pActSupp4 + (pBreakdown.byNumber[4] || 0)),
+                  supp5: round2(pActSupp5 + (pBreakdown.byNumber[5] || 0) + extraSlotsSum),
                   revised: s.revisedBudget,
                   annPT: s.annualPhysicalTarget,
                   annPA: s.annualPhysicalActual,
@@ -535,43 +612,104 @@ export async function populateOfficialExcelTemplate(options: {
                   finPct: s.financialAccomplishmentPct,
                   remaining: s.remainingBudget,
                   utilPct: share,
-                  status: s.budgetUtilizationPct >= 100 ? 'COMPLETED' : 'ON-GOING',
+                  status: s.program.status || 'PENDING',
                   remarks: '',
+                  monthly: buildProgramMonthlyMap(s.program, progActs),
                 };
               })
             : computedList.map((act) => {
                 const prog = progById.get(act.programId);
+                const progSum = progSumMap.get(act.programId);
+                const bd = resolveActivityBudgetDisplay(act, prog, progSum);
+                const siblingCount = actCountByProgram.get(act.programId) || 1;
+                if (bd.isProgramBudget && siblingCount > 1) {
+                  hasSharedProgBudget = true;
+                }
+
+                const progMonthlySum = prog
+                  ? sumMonthlyPhysicalTargets(prog.monthlyPhysicalTarget)
+                  : 0;
+                const useProgMonthlyPT =
+                  act.annualPhysicalTarget === 0 && progMonthlySum > 0 && Boolean(prog);
+                if (useProgMonthlyPT && siblingCount > 1) {
+                  hasSharedProgTargets = true;
+                }
+
+                const effectiveMonthly = createEmptyMonthlyData();
+                for (const m of MONTHS) {
+                  const base = act.monthly[m.key];
+                  effectiveMonthly[m.key] = {
+                    ...base,
+                    physicalTarget: useProgMonthlyPT
+                      ? Math.max(0, safeNum(prog?.monthlyPhysicalTarget?.[m.key]))
+                      : base.physicalTarget,
+                  };
+                }
+                const effectiveAnnPT = useProgMonthlyPT
+                  ? progMonthlySum
+                  : act.annualPhysicalTarget;
+                const effectivePhysPct =
+                  effectiveAnnPT > 0
+                    ? round2((act.annualPhysicalActual / effectiveAnnPT) * 100)
+                    : 0;
+
+                const effectiveSource =
+                  act.sourceOfFund || prog?.sourceOfFund || act.budgetClassification;
+                const effectiveClassification =
+                  act.approvedBudget === 0 && bd.approvedBudget > 0
+                    ? classifyFundBucket(effectiveSource)
+                    : act.budgetClassification;
+
+                const progSuppBreakdown =
+                  bd.isProgramBudget && act.totalSupplemental === 0 && prog
+                    ? getProgramSupplementalBreakdown(prog)
+                    : null;
+                const extraProgSlots = progSuppBreakdown
+                  ? round2(
+                      progSuppBreakdown.orderedSlots
+                        .filter((slot) => slot.slotNumber > 5)
+                        .reduce((sum, slot) => sum + slot.amount, 0)
+                    )
+                  : 0;
+
                 return {
                   ref: act.referenceNumber,
                   description: act.description,
                   program: prog?.title || '',
                   targetOutputs: act.targetOutputs || '',
                   office: act.officeName,
-                  sourceOfFund: act.sourceOfFund || prog?.sourceOfFund || '',
-                  classification: act.budgetClassification,
-                  gf: act.gf,
-                  ps: act.ps,
-                  mooe: act.mooe,
-                  co: act.co,
-                  approved: act.approvedBudget,
+                  sourceOfFund: effectiveSource || '',
+                  classification: effectiveClassification,
+                  gf: bd.gf,
+                  ps: bd.ps,
+                  mooe: bd.mooe,
+                  co: bd.co,
+                  approved: bd.approvedBudget,
                   withheld: act.withheldAmount,
-                  supp1: act.supplementalBudget1,
-                  supp2: act.supplementalBudget2,
-                  supp3: act.supplementalBudget3,
-                  supp4: act.supplementalBudget4,
-                  supp5: act.supplementalBudget5,
-                  revised: act.revisedBudget,
-                  annPT: act.annualPhysicalTarget,
+                  supp1: progSuppBreakdown ? progSuppBreakdown.byNumber[1] || 0 : act.supplementalBudget1,
+                  supp2: progSuppBreakdown ? progSuppBreakdown.byNumber[2] || 0 : act.supplementalBudget2,
+                  supp3: progSuppBreakdown ? progSuppBreakdown.byNumber[3] || 0 : act.supplementalBudget3,
+                  supp4: progSuppBreakdown ? progSuppBreakdown.byNumber[4] || 0 : act.supplementalBudget4,
+                  supp5: progSuppBreakdown
+                    ? round2((progSuppBreakdown.byNumber[5] || 0) + extraProgSlots)
+                    : act.supplementalBudget5,
+                  revised: bd.revisedBudget,
+                  annPT: effectiveAnnPT,
                   annPA: act.annualPhysicalActual,
-                  physPct: act.physicalAccomplishmentPct,
+                  physPct: effectivePhysPct,
                   annFT: act.annualFinancialTarget,
                   annFA: act.annualFinancialActual,
                   finPct: act.financialAccomplishmentPct,
-                  remaining: act.remainingBudget,
-                  utilPct: act.budgetUtilizationPct,
-                  status: act.status,
+                  remaining: bd.isProgramBudget
+                    ? round2(bd.revisedBudget - act.annualFinancialActual)
+                    : act.remainingBudget,
+                  utilPct:
+                    bd.revisedBudget > 0
+                      ? round2((act.annualFinancialActual / bd.revisedBudget) * 100)
+                      : 0,
+                  status: prog?.status || act.status,
                   remarks: act.remarks || '',
-                  monthly: act.monthly,
+                  monthly: effectiveMonthly,
                 };
               });
 
@@ -802,7 +940,32 @@ export async function populateOfficialExcelTemplate(options: {
         const findCol = (field: string) => colFieldMap.find((m) => m.field === field)?.col;
         for (const mapping of colFieldMap) {
           const destTotalCell = totalRowCandidate.getCell(mapping.col);
-          if (
+          const isBudgetSharedField =
+            hasSharedProgBudget &&
+            ['gf', 'ps', 'mooe', 'co', 'approved', 'revised', 'remaining'].includes(mapping.field);
+          const isTargetSharedField =
+            hasSharedProgTargets &&
+            (mapping.field === 'annPT' ||
+              (mapping.field === 'monthly' && mapping.monthProp === 'pt'));
+
+          if (isBudgetSharedField) {
+            if (mapping.field === 'gf') destTotalCell.value = dashSummary.totalGF;
+            else if (mapping.field === 'ps') destTotalCell.value = dashSummary.totalPS;
+            else if (mapping.field === 'mooe') destTotalCell.value = dashSummary.totalMOOE;
+            else if (mapping.field === 'co') destTotalCell.value = dashSummary.totalCO;
+            else if (mapping.field === 'approved') destTotalCell.value = dashSummary.totalApprovedBudget;
+            else if (mapping.field === 'revised') destTotalCell.value = dashSummary.totalRevisedBudget;
+            else if (mapping.field === 'remaining') destTotalCell.value = dashSummary.remainingBudget;
+            if (!destTotalCell.numFmt) destTotalCell.numFmt = '₱#,##0.00';
+          } else if (isTargetSharedField) {
+            if (mapping.field === 'annPT') {
+              destTotalCell.value = dashSummary.totalPhysicalTarget;
+            } else if (mapping.monthKey) {
+              const ms = dashSummary.monthlySeries.find((item) => item.monthKey === mapping.monthKey);
+              destTotalCell.value = ms ? ms.physicalTarget : 0;
+            }
+            if (!destTotalCell.numFmt) destTotalCell.numFmt = '#,##0.##';
+          } else if (
             ['gf', 'ps', 'mooe', 'co', 'approved', 'withheld', 'supp1', 'supp2', 'supp3', 'supp4', 'supp5', 'revised', 'annPT', 'annPA', 'annFT', 'annFA', 'remaining', 'monthly'].includes(
               mapping.field
             )
@@ -1149,16 +1312,23 @@ export async function exportMonitoringWorkbook(options: {
     templateBuffer,
   } = options;
 
+  const programStatusById = new Map(programs.map((p) => [p.id, p.status || 'PENDING']));
+
   if (templateBuffer) {
     return populateOfficialExcelTemplate({
       templateBuffer,
       fiscalYear,
       monthKey,
       reportType: reportType || 'annual_ppa',
-      programs: programs.filter((p) => programFilterId === 'ALL' || p.id === programFilterId),
+      programs: programs.filter((p) => {
+        if (programFilterId !== 'ALL' && p.id !== programFilterId) return false;
+        if (statusFilter !== 'ALL' && (p.status || 'PENDING') !== statusFilter) return false;
+        return true;
+      }),
       activities: activities.filter((a) => {
         if (programFilterId !== 'ALL' && a.programId !== programFilterId) return false;
-        if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
+        const effStatus = programStatusById.get(a.programId) || a.status || 'PENDING';
+        if (statusFilter !== 'ALL' && effStatus !== statusFilter) return false;
         return true;
       }),
       settings: settings || {
@@ -1188,7 +1358,10 @@ export async function exportMonitoringWorkbook(options: {
     const filteredPrograms = programs.filter(
       (p) =>
         (fiscalYear === 'ALL' || p.fiscalYear === fiscalYear) &&
-        (programFilterId === 'ALL' || p.id === programFilterId)
+        (programFilterId === 'ALL' || p.id === programFilterId) &&
+        (reportType === 'gad_compliance' ||
+          statusFilter === 'ALL' ||
+          (p.status || 'PENDING') === statusFilter)
     );
     const filteredComputed = filterActivitiesForReport(
       reportType,
@@ -1196,10 +1369,12 @@ export async function exportMonitoringWorkbook(options: {
         .filter((a) => {
           if (fiscalYear !== 'ALL' && a.fiscalYear !== fiscalYear) return false;
           if (programFilterId !== 'ALL' && a.programId !== programFilterId) return false;
-          if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
+          const effStatus = programStatusById.get(a.programId) || a.status || 'PENDING';
+          if (statusFilter !== 'ALL' && effStatus !== statusFilter) return false;
           return true;
         })
-        .map(computeActivityMetrics)
+        .map(computeActivityMetrics),
+      programs
     );
 
     await addCanonicalReportWorksheet({
@@ -1465,16 +1640,18 @@ export async function exportMonitoringWorkbook(options: {
     const fyPrograms = programs.filter(
       (p) =>
         (fiscalYear === 'ALL' || p.fiscalYear === fiscalYear) &&
-        (programFilterId === 'ALL' || p.id === programFilterId)
+        (programFilterId === 'ALL' || p.id === programFilterId) &&
+        (statusFilter === 'ALL' || (p.status || 'PENDING') === statusFilter)
     );
     const rawFyActivities = activities.filter((a) => {
       if (fiscalYear !== 'ALL' && a.fiscalYear !== fiscalYear) return false;
       if (programFilterId !== 'ALL' && a.programId !== programFilterId) return false;
-      if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
+      const effStatus = programStatusById.get(a.programId) || a.status || 'PENDING';
+      if (statusFilter !== 'ALL' && effStatus !== statusFilter) return false;
       return true;
     });
     const computedList = reportType
-      ? filterActivitiesForReport(reportType, rawFyActivities.map(computeActivityMetrics))
+      ? filterActivitiesForReport(reportType, rawFyActivities.map(computeActivityMetrics), programs)
       : rawFyActivities.map(computeActivityMetrics);
 
     const programMap = new Map(fyPrograms.map((p) => [p.id, p]));
@@ -1485,13 +1662,19 @@ export async function exportMonitoringWorkbook(options: {
       ),
     ];
 
+    const summaryRowIndices: number[] = [];
     const dataRowIndices: number[] = [];
 
     for (const progId of orderedProgramIds) {
       const prog = programMap.get(progId);
       const progActivities = computedList.filter((a) => a.programId === progId);
       if (!prog && progActivities.length === 0) continue;
-      if (statusFilter !== 'ALL' && progActivities.length === 0) continue;
+      if (statusFilter !== 'ALL' && !prog && progActivities.length === 0) continue;
+
+      const progSummary = prog ? summarizeProgram(prog, progActivities) : null;
+      const hasProgMonthlyTargets = Boolean(
+        prog && sumMonthlyPhysicalTargets(prog.monthlyPhysicalTarget) > 0
+      );
 
       const pRow = ws.getRow(currentRow);
       pRow.height = 22;
@@ -1499,30 +1682,233 @@ export async function exportMonitoringWorkbook(options: {
       pRow.getCell(2).value = escapeExcelExportText(prog?.title || 'Unassigned Program');
       pRow.getCell(3).value = escapeExcelExportText(prog?.sector || '');
       pRow.getCell(5).value = escapeExcelExportText(prog?.officeName || '');
-      if (prog && safeNum(prog.budget) > 0) {
-        const progApp = round2(safeNum(prog.budget));
-        const progRev = calculateRevisedBudgetByFund(progApp, prog.sourceOfFund);
-        const progExp = round2(
-          progActivities.reduce((sum, item) => sum + item.annualFinancialActual, 0)
+
+      const progClassLabel = prog?.sourceOfFund
+        ? classifyFundBucket(prog.sourceOfFund)
+        : progActivities[0]?.budgetClassification || '';
+      pRow.getCell(6).value = escapeExcelExportText(progClassLabel);
+
+      const pGf = progSummary
+        ? progSummary.gf
+        : round2(progActivities.reduce((s, a) => s + a.gf, 0));
+      const pPs = progSummary
+        ? progSummary.ps
+        : round2(progActivities.reduce((s, a) => s + a.ps, 0));
+      const pMooe = progSummary
+        ? progSummary.mooe
+        : round2(progActivities.reduce((s, a) => s + a.mooe, 0));
+      const pCo = progSummary
+        ? progSummary.co
+        : round2(progActivities.reduce((s, a) => s + a.co, 0));
+      const pApproved = progSummary
+        ? progSummary.approvedBudget
+        : round2(pGf + pPs + pMooe + pCo);
+      const pWithheld = progSummary
+        ? progSummary.withheldAmount
+        : round2(progActivities.reduce((s, a) => s + a.withheldAmount, 0));
+      const progSuppBreakdown = getProgramSupplementalBreakdown(prog);
+      const extraProgSlotsSum = round2(
+        progSuppBreakdown.orderedSlots
+          .filter((slot) => slot.slotNumber > 5)
+          .reduce((sum, slot) => sum + slot.amount, 0)
+      );
+      const pSupp1 = round2(
+        progActivities.reduce((s, a) => s + a.supplementalBudget1, 0) +
+          (progSuppBreakdown.byNumber[1] || 0)
+      );
+      const pSupp2 = round2(
+        progActivities.reduce((s, a) => s + a.supplementalBudget2, 0) +
+          (progSuppBreakdown.byNumber[2] || 0)
+      );
+      const pSupp3 = round2(
+        progActivities.reduce((s, a) => s + a.supplementalBudget3, 0) +
+          (progSuppBreakdown.byNumber[3] || 0)
+      );
+      const pSupp4 = round2(
+        progActivities.reduce((s, a) => s + a.supplementalBudget4, 0) +
+          (progSuppBreakdown.byNumber[4] || 0)
+      );
+      const pSupp5 = round2(
+        progActivities.reduce((s, a) => s + a.supplementalBudget5, 0) +
+          (progSuppBreakdown.byNumber[5] || 0) +
+          extraProgSlotsSum
+      );
+      const pRevised = progSummary
+        ? progSummary.revisedBudget
+        : round2(progActivities.reduce((s, a) => s + a.revisedBudget, 0));
+
+      pRow.getCell(7).value = pGf;
+      pRow.getCell(8).value = pPs;
+      pRow.getCell(9).value = pMooe;
+      pRow.getCell(10).value = pCo;
+      pRow.getCell(11).value = {
+        formula: `SUM(G${currentRow}:J${currentRow})`,
+        result: pApproved,
+      };
+      pRow.getCell(12).value = pWithheld;
+      pRow.getCell(13).value = pSupp1;
+      pRow.getCell(14).value = pSupp2;
+      pRow.getCell(15).value = pSupp3;
+      pRow.getCell(16).value = pSupp4;
+      pRow.getCell(17).value = pSupp5;
+      const linearProgRev = round2(pPs + (pGf + pMooe + pCo) * 0.85);
+      pRow.getCell(18).value =
+        Math.abs(linearProgRev - pRevised) < 0.02
+          ? {
+              formula:
+                isPersonnelServicesFund(prog?.sourceOfFund) && pGf === 0 && pMooe === 0 && pCo === 0
+                  ? `K${currentRow}`
+                  : `H${currentRow}+((G${currentRow}+I${currentRow}+J${currentRow})*0.85)`,
+              result: pRevised,
+            }
+          : pRevised;
+
+      const pPtCols: string[] = [];
+      const pFtCols: string[] = [];
+      const pPaCols: string[] = [];
+      const pFaCols: string[] = [];
+      let pColCursor = 19;
+      for (const m of MONTHS) {
+        const mPT = hasProgMonthlyTargets
+          ? Math.max(0, safeNum(prog?.monthlyPhysicalTarget?.[m.key]))
+          : Math.round(
+              progActivities.reduce((s, a) => s + safeNum(a.monthly[m.key].physicalTarget), 0) *
+                10000
+            ) / 10000;
+        const mFT = round2(
+          progActivities.reduce((s, a) => s + safeNum(a.monthly[m.key].financialTarget), 0)
         );
-        pRow.getCell(11).value = progApp;
-        pRow.getCell(11).numFmt = '₱#,##0.00';
-        pRow.getCell(18).value = progRev;
-        pRow.getCell(18).numFmt = '₱#,##0.00';
-        pRow.getCell(annualStart + 4).value = progExp;
-        pRow.getCell(annualStart + 4).numFmt = '₱#,##0.00';
-        pRow.getCell(annualStart + 6).value = round2(progRev - progExp);
-        pRow.getCell(annualStart + 6).numFmt = '₱#,##0.00';
+        const mPA =
+          Math.round(
+            progActivities.reduce((s, a) => s + safeNum(a.monthly[m.key].physicalActual), 0) *
+              10000
+          ) / 10000;
+        const mFA = round2(
+          progActivities.reduce((s, a) => s + safeNum(a.monthly[m.key].financialActual), 0)
+        );
+
+        pRow.getCell(pColCursor).value = mPT;
+        pRow.getCell(pColCursor + 1).value = mFT;
+        pRow.getCell(pColCursor + 2).value = mPA;
+        pRow.getCell(pColCursor + 3).value = mFA;
+
+        pPtCols.push(`${colLetter(pColCursor)}${currentRow}`);
+        pFtCols.push(`${colLetter(pColCursor + 1)}${currentRow}`);
+        pPaCols.push(`${colLetter(pColCursor + 2)}${currentRow}`);
+        pFaCols.push(`${colLetter(pColCursor + 3)}${currentRow}`);
+
+        pRow.getCell(pColCursor).numFmt = '#,##0.##';
+        pRow.getCell(pColCursor + 1).numFmt = '₱#,##0.00';
+        pRow.getCell(pColCursor + 2).numFmt = '#,##0.##';
+        pRow.getCell(pColCursor + 3).numFmt = '₱#,##0.00';
+
+        pColCursor += 4;
       }
+
+      const pAnnPT = progSummary
+        ? progSummary.annualPhysicalTarget
+        : Math.round(progActivities.reduce((s, a) => s + a.annualPhysicalTarget, 0) * 10000) /
+          10000;
+      const pAnnPA = progSummary
+        ? progSummary.annualPhysicalActual
+        : Math.round(progActivities.reduce((s, a) => s + a.annualPhysicalActual, 0) * 10000) /
+          10000;
+      const pAnnFT = progSummary
+        ? progSummary.annualFinancialTarget
+        : round2(progActivities.reduce((s, a) => s + a.annualFinancialTarget, 0));
+      const pAnnFA = progSummary
+        ? progSummary.annualFinancialActual
+        : round2(progActivities.reduce((s, a) => s + a.annualFinancialActual, 0));
+      const pRemaining = progSummary
+        ? progSummary.remainingBudget
+        : round2(pRevised - pAnnFA);
+      const pPhysPct = pAnnPT > 0 ? round2((pAnnPA / pAnnPT) * 100) : 0;
+      const pFinPct = pAnnFT > 0 ? round2((pAnnFA / pAnnFT) * 100) : 0;
+      const pUtilPct = pRevised > 0 ? round2((pAnnFA / pRevised) * 100) : 0;
+
+      const cAnnPT = colLetter(annualStart);
+      const cAnnPA = colLetter(annualStart + 1);
+      const cAnnFT = colLetter(annualStart + 3);
+      const cAnnFA = colLetter(annualStart + 4);
+
+      const useMonthlyPtFormulaOnProg =
+        hasProgMonthlyTargets || progActivities.some((a) => a.annualPhysicalTarget > 0);
+      pRow.getCell(annualStart).value = useMonthlyPtFormulaOnProg
+        ? { formula: pPtCols.join('+'), result: pAnnPT }
+        : pAnnPT;
+      pRow.getCell(annualStart + 1).value = {
+        formula: pPaCols.join('+'),
+        result: pAnnPA,
+      };
+      pRow.getCell(annualStart + 2).value = {
+        formula: `IF(${cAnnPT}${currentRow}=0,0,${cAnnPA}${currentRow}/${cAnnPT}${currentRow})`,
+        result: pPhysPct / 100,
+      };
+      pRow.getCell(annualStart + 3).value = {
+        formula: pFtCols.join('+'),
+        result: pAnnFT,
+      };
+      pRow.getCell(annualStart + 4).value = {
+        formula: pFaCols.join('+'),
+        result: pAnnFA,
+      };
+      pRow.getCell(annualStart + 5).value = {
+        formula: `IF(${cAnnFT}${currentRow}=0,0,${cAnnFA}${currentRow}/${cAnnFT}${currentRow})`,
+        result: pFinPct / 100,
+      };
+      pRow.getCell(annualStart + 6).value = {
+        formula: `R${currentRow}-${cAnnFA}${currentRow}`,
+        result: pRemaining,
+      };
+      pRow.getCell(annualStart + 7).value = {
+        formula: `IF(R${currentRow}=0,0,${cAnnFA}${currentRow}/R${currentRow})`,
+        result: pUtilPct / 100,
+      };
+      pRow.getCell(annualStart + 8).value = escapeExcelExportText(prog?.status || 'PENDING');
+
+      for (let c = 7; c <= 18; c++) pRow.getCell(c).numFmt = '₱#,##0.00';
+      pRow.getCell(annualStart).numFmt = '#,##0.##';
+      pRow.getCell(annualStart + 1).numFmt = '#,##0.##';
+      pRow.getCell(annualStart + 2).numFmt = '0.00%';
+      pRow.getCell(annualStart + 3).numFmt = '₱#,##0.00';
+      pRow.getCell(annualStart + 4).numFmt = '₱#,##0.00';
+      pRow.getCell(annualStart + 5).numFmt = '0.00%';
+      pRow.getCell(annualStart + 6).numFmt = '₱#,##0.00';
+      pRow.getCell(annualStart + 7).numFmt = '0.00%';
+
       for (let c = 1; c <= totalCols; c++) {
         const cell = pRow.getCell(c);
         cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
         cell.font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FF0F294A' } };
         cell.alignment = { vertical: 'middle', wrapText: true };
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+          bottom: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+          left: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+          right: { style: 'thin', color: { argb: 'FFCBD5E1' } },
+        };
       }
+      summaryRowIndices.push(currentRow);
       currentRow++;
 
       for (const act of progActivities) {
+        const bd = resolveActivityBudgetDisplay(act, prog, progSummary || undefined);
+        const effectiveSource =
+          act.sourceOfFund || (bd.isProgramBudget ? prog?.sourceOfFund : undefined) || act.budgetClassification;
+        const effectiveClass =
+          act.approvedBudget === 0 && bd.approvedBudget > 0
+            ? classifyFundBucket(effectiveSource)
+            : act.budgetClassification;
+        const useProgMonthlyPT = act.annualPhysicalTarget === 0 && hasProgMonthlyTargets;
+        const effAnnPT = useProgMonthlyPT
+          ? sumMonthlyPhysicalTargets(prog?.monthlyPhysicalTarget)
+          : act.annualPhysicalTarget;
+        const effPhysPct =
+          effAnnPT > 0 ? round2((act.annualPhysicalActual / effAnnPT) * 100) : 0;
+        const actRemaining = round2(bd.revisedBudget - act.annualFinancialActual);
+        const actUtilPct =
+          bd.revisedBudget > 0 ? round2((act.annualFinancialActual / bd.revisedBudget) * 100) : 0;
+
         const r = ws.getRow(currentRow);
         r.height = estimateWrappedRowHeight([
           act.description,
@@ -1534,30 +1920,51 @@ export async function exportMonitoringWorkbook(options: {
         r.getCell(3).value = escapeExcelExportText(prog?.title || '');
         r.getCell(4).value = escapeExcelExportText(act.targetOutputs || '');
         r.getCell(5).value = escapeExcelExportText(act.officeName);
-        r.getCell(6).value = escapeExcelExportText(act.budgetClassification);
-        r.getCell(7).value = act.gf;
-        r.getCell(8).value = act.ps;
-        r.getCell(9).value = act.mooe;
-        r.getCell(10).value = act.co;
+        r.getCell(6).value = escapeExcelExportText(effectiveClass);
+        r.getCell(7).value = bd.gf;
+        r.getCell(8).value = bd.ps;
+        r.getCell(9).value = bd.mooe;
+        r.getCell(10).value = bd.co;
         r.getCell(11).value = {
           formula: `SUM(G${currentRow}:J${currentRow})`,
-          result: act.approvedBudget,
+          result: bd.approvedBudget,
         };
         r.getCell(12).value = act.withheldAmount;
-        r.getCell(13).value = act.supplementalBudget1;
-        r.getCell(14).value = act.supplementalBudget2;
-        r.getCell(15).value = act.supplementalBudget3;
-        r.getCell(16).value = act.supplementalBudget4;
-        r.getCell(17).value = act.supplementalBudget5;
+        const actProgSuppBreakdown =
+          bd.isProgramBudget && act.totalSupplemental === 0 && prog
+            ? getProgramSupplementalBreakdown(prog)
+            : null;
+        const actExtraProgSlots = actProgSuppBreakdown
+          ? round2(
+              actProgSuppBreakdown.orderedSlots
+                .filter((slot) => slot.slotNumber > 5)
+                .reduce((sum, slot) => sum + slot.amount, 0)
+            )
+          : 0;
+        r.getCell(13).value = actProgSuppBreakdown
+          ? actProgSuppBreakdown.byNumber[1] || 0
+          : act.supplementalBudget1;
+        r.getCell(14).value = actProgSuppBreakdown
+          ? actProgSuppBreakdown.byNumber[2] || 0
+          : act.supplementalBudget2;
+        r.getCell(15).value = actProgSuppBreakdown
+          ? actProgSuppBreakdown.byNumber[3] || 0
+          : act.supplementalBudget3;
+        r.getCell(16).value = actProgSuppBreakdown
+          ? actProgSuppBreakdown.byNumber[4] || 0
+          : act.supplementalBudget4;
+        r.getCell(17).value = actProgSuppBreakdown
+          ? round2((actProgSuppBreakdown.byNumber[5] || 0) + actExtraProgSlots)
+          : act.supplementalBudget5;
         r.getCell(18).value = {
           formula:
-            isPersonnelServicesFund(act.sourceOfFund || act.budgetClassification) &&
-            act.gf === 0 &&
-            act.mooe === 0 &&
-            act.co === 0
+            isPersonnelServicesFund(effectiveSource) &&
+            bd.gf === 0 &&
+            bd.mooe === 0 &&
+            bd.co === 0
               ? `K${currentRow}`
               : `H${currentRow}+((G${currentRow}+I${currentRow}+J${currentRow})*0.85)`,
-          result: act.revisedBudget,
+          result: bd.revisedBudget,
         };
 
         const ptCols: string[] = [];
@@ -1568,7 +1975,10 @@ export async function exportMonitoringWorkbook(options: {
         let cIdx = 19;
         for (const m of MONTHS) {
           const mData = act.monthly[m.key];
-          r.getCell(cIdx).value = mData.physicalTarget;
+          const cellPT = useProgMonthlyPT
+            ? Math.max(0, safeNum(prog?.monthlyPhysicalTarget?.[m.key]))
+            : mData.physicalTarget;
+          r.getCell(cIdx).value = cellPT;
           r.getCell(cIdx + 1).value = mData.financialTarget;
           r.getCell(cIdx + 2).value = mData.physicalActual;
           r.getCell(cIdx + 3).value = mData.financialActual;
@@ -1593,7 +2003,7 @@ export async function exportMonitoringWorkbook(options: {
 
         r.getCell(annualStart).value = {
           formula: ptCols.join('+'),
-          result: act.annualPhysicalTarget,
+          result: effAnnPT,
         };
         r.getCell(annualStart + 1).value = {
           formula: paCols.join('+'),
@@ -1601,7 +2011,7 @@ export async function exportMonitoringWorkbook(options: {
         };
         r.getCell(annualStart + 2).value = {
           formula: `IF(${cAnnPT}${currentRow}=0,0,${cAnnPA}${currentRow}/${cAnnPT}${currentRow})`,
-          result: act.physicalAccomplishmentPct / 100,
+          result: effPhysPct / 100,
         };
         r.getCell(annualStart + 3).value = {
           formula: ftCols.join('+'),
@@ -1617,13 +2027,13 @@ export async function exportMonitoringWorkbook(options: {
         };
         r.getCell(annualStart + 6).value = {
           formula: `R${currentRow}-${cAnnFA}${currentRow}`,
-          result: act.remainingBudget,
+          result: actRemaining,
         };
         r.getCell(annualStart + 7).value = {
           formula: `IF(R${currentRow}=0,0,${cAnnFA}${currentRow}/R${currentRow})`,
-          result: act.budgetUtilizationPct / 100,
+          result: actUtilPct / 100,
         };
-        r.getCell(annualStart + 8).value = escapeExcelExportText(act.status);
+        r.getCell(annualStart + 8).value = escapeExcelExportText(prog?.status || act.status);
         r.getCell(annualStart + 9).value = escapeExcelExportText(act.remarks || '');
 
         for (let c = 7; c <= 18; c++) r.getCell(c).numFmt = '₱#,##0.00';
@@ -1655,14 +2065,16 @@ export async function exportMonitoringWorkbook(options: {
       }
     }
 
-    if (dataRowIndices.length > 0) {
+    const grandTotalRowIndices =
+      summaryRowIndices.length > 0 ? summaryRowIndices : dataRowIndices;
+    if (grandTotalRowIndices.length > 0) {
       const gt = ws.getRow(currentRow);
       gt.height = 24;
       gt.getCell(1).value = 'TOTAL';
-      gt.getCell(2).value = `GRAND TOTAL (${dataRowIndices.length} Projects & Activities)`;
+      gt.getCell(2).value = `GRAND TOTAL (${summaryRowIndices.length} Programs · ${dataRowIndices.length} Projects & Activities)`;
 
       const sumCells = (colIdx: number) =>
-        dataRowIndices.map((rIdx) => `${colLetter(colIdx)}${rIdx}`).join('+');
+        grandTotalRowIndices.map((rIdx) => `${colLetter(colIdx)}${rIdx}`).join('+');
 
       for (let c = 7; c <= 18; c++) {
         gt.getCell(c).value = { formula: sumCells(c) };
@@ -2098,13 +2510,15 @@ export async function parseMonitoringWorkbook(
 
     const isProgramHeader =
       !outputsVal &&
-      !rawClass &&
       !rawStatus &&
       !rawRemarks &&
-      !hasBudgetSplit &&
-      !hasAnyMonthlyData &&
       descVal.length > 0 &&
-      (isShadedProgramBand || (!progColVal && approvedCheck.value === 0));
+      (isShadedProgramBand ||
+        (!rawClass &&
+          !hasBudgetSplit &&
+          !hasAnyMonthlyData &&
+          !progColVal &&
+          approvedCheck.value === 0));
 
     if (isProgramHeader) {
       currentProgramTitle = descVal;
@@ -2293,6 +2707,7 @@ export function materializeImportedRecords(options: {
         sector: 'General Public Services',
         officeId: office.id,
         officeName: office.name,
+        status: row.status || 'PENDING',
         parentProgramId: null,
         orderIndex: existingPrograms.length + newPrograms.length + 1,
         createdAt: now,

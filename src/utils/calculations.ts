@@ -349,6 +349,60 @@ export function inferProgramFundBreakdown(
   return inferFundAmounts(approvedBudget, program.sourceOfFund);
 }
 
+export interface ProgramSupplementalSlot {
+  slotNumber: number;
+  label: string;
+  amount: number;
+}
+
+export interface ProgramSupplementalBreakdown {
+  byNumber: Record<number, number>;
+  orderedSlots: ProgramSupplementalSlot[];
+  total: number;
+}
+
+export function getProgramSupplementalBreakdown(
+  program?: Program | null
+): ProgramSupplementalBreakdown {
+  const byNumber: Record<number, number> = {};
+  if (!program) {
+    return { byNumber, orderedSlots: [], total: 0 };
+  }
+
+  const logs = Array.isArray(program.supplementalLogs) ? program.supplementalLogs : [];
+  let loggedSum = 0;
+  for (const entry of logs) {
+    const slot = Math.max(1, Math.floor(safeNum(entry.supplementalNumber) || 1));
+    const signed = round2(safeNum(entry.signedAmount));
+    byNumber[slot] = round2((byNumber[slot] || 0) + signed);
+    loggedSum = round2(loggedSum + signed);
+  }
+
+  const total = round2(safeNum(program.supplementalBudget));
+  const residual = round2(total - loggedSum);
+  if (Math.abs(residual) >= 0.01) {
+    byNumber[1] = round2((byNumber[1] || 0) + residual);
+  }
+
+  const slotNums = Object.keys(byNumber)
+    .map((k) => Number(k))
+    .filter((n) => Number.isFinite(n) && n >= 1);
+  const maxSlot = Math.max(5, ...slotNums);
+  const orderedSlots: ProgramSupplementalSlot[] = [];
+  for (let i = 1; i <= maxSlot; i++) {
+    const amt = round2(byNumber[i] || 0);
+    if (i <= 5 || amt !== 0 || byNumber[i] !== undefined) {
+      orderedSlots.push({
+        slotNumber: i,
+        label: `Supplemental Budget ${i}`,
+        amount: amt,
+      });
+    }
+  }
+
+  return { byNumber, orderedSlots, total };
+}
+
 export interface ProgramSummary {
   program: Program;
   activityCount: number;
@@ -423,10 +477,14 @@ export function summarizeProgram(
   let approvedBudget = 0;
   let revisedBudget = 0;
 
+  const effectiveProgramSource =
+    program.sourceOfFund ||
+    (ps > 0 && gf === 0 && mooe === 0 && co === 0 ? 'PS' : '');
+
   if (useProgramBudget) {
     approvedBudget = Math.max(0, round2(programBudget + programSupplemental));
-    revisedBudget = calculateRevisedBudgetByFund(approvedBudget, program.sourceOfFund);
-    const breakdown = inferProgramFundBreakdown(program, approvedBudget);
+    revisedBudget = calculateRevisedBudgetByFund(approvedBudget, effectiveProgramSource);
+    const breakdown = inferFundAmounts(approvedBudget, effectiveProgramSource);
     gf = breakdown.gf;
     ps = breakdown.ps;
     mooe = breakdown.mooe;
@@ -438,13 +496,13 @@ export function summarizeProgram(
       0,
       round2(
         activitiesRevised +
-          calculateSignedRevisedDelta(effectiveDelta, program.sourceOfFund)
+          calculateSignedRevisedDelta(effectiveDelta, effectiveProgramSource)
       )
     );
     const adjustedBuckets = applySignedFundBucketDelta(
       { gf, ps, mooe, co },
       effectiveDelta,
-      program.sourceOfFund
+      effectiveProgramSource
     );
     gf = adjustedBuckets.gf;
     ps = adjustedBuckets.ps;
@@ -671,11 +729,6 @@ export function computeDashboardSummary(
       );
     }
 
-    if (a.status === 'COMPLETED') completedCount++;
-    else if (a.status === 'ON-GOING') ongoingCount++;
-    else if (a.status === 'PENDING') pendingCount++;
-    else if (a.status === 'NOT IMPLEMENTED') notImplementedCount++;
-
     for (const m of MONTHS) {
       monthlyAccum[m.key].physicalTarget += a.monthly[m.key].physicalTarget;
       monthlyAccum[m.key].physicalActual += a.monthly[m.key].physicalActual;
@@ -702,16 +755,29 @@ export function computeDashboardSummary(
   for (const p of programs) {
     if (seenPrograms.has(p.id)) continue;
     seenPrograms.add(p.id);
+    const progStatus = p.status || 'PENDING';
+    if (progStatus === 'COMPLETED') completedCount++;
+    else if (progStatus === 'ON-GOING') ongoingCount++;
+    else if (progStatus === 'PENDING') pendingCount++;
+    else if (progStatus === 'NOT IMPLEMENTED') notImplementedCount++;
     const progBudget = round2(safeNum(p.budget));
     const progSupp = round2(safeNum(p.supplementalBudget));
     totalSupplemental = round2(totalSupplemental + progSupp);
     const actApproved = round2(approvedByProgram.get(p.id) || 0);
+    const progActsForSource = computedActivities.filter(
+      (a) => a.programId === p.id || a.subprogramId === p.id
+    );
+    const allChildPsOnly =
+      progActsForSource.length > 0 &&
+      progActsForSource.every((a) => a.ps > 0 && a.gf === 0 && a.mooe === 0 && a.co === 0);
+    const effectiveProgSource = p.sourceOfFund || (allChildPsOnly ? 'PS' : '');
+
     if (actApproved === 0) {
       const effectiveProgBudget = Math.max(0, round2(progBudget + progSupp));
       if (effectiveProgBudget > 0) {
         totalApprovedBudget += effectiveProgBudget;
-        totalRevisedBudget += calculateRevisedBudgetByFund(effectiveProgBudget, p.sourceOfFund);
-        const breakdown = inferProgramFundBreakdown(p, effectiveProgBudget);
+        totalRevisedBudget += calculateRevisedBudgetByFund(effectiveProgBudget, effectiveProgSource);
+        const breakdown = inferFundAmounts(effectiveProgBudget, effectiveProgSource);
         totalGF += breakdown.gf;
         totalPS += breakdown.ps;
         totalMOOE += breakdown.mooe;
@@ -722,12 +788,12 @@ export function computeDashboardSummary(
       totalApprovedBudget += effectiveDelta;
       totalRevisedBudget = Math.max(
         0,
-        round2(totalRevisedBudget + calculateSignedRevisedDelta(effectiveDelta, p.sourceOfFund))
+        round2(totalRevisedBudget + calculateSignedRevisedDelta(effectiveDelta, effectiveProgSource))
       );
       const adjusted = applySignedFundBucketDelta(
         { gf: totalGF, ps: totalPS, mooe: totalMOOE, co: totalCO },
         effectiveDelta,
-        p.sourceOfFund
+        effectiveProgSource
       );
       totalGF = adjusted.gf;
       totalPS = adjusted.ps;

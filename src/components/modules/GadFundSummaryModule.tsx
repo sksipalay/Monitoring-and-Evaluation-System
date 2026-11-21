@@ -786,7 +786,7 @@ export function GadFundSummaryModule({
                                                   {formatPct(act.physicalAccomplishmentPct)}
                                                 </td>
                                                 <td className="py-2 px-3">
-                                                  <StatusBadge status={act.status} compact />
+                                                  <StatusBadge status={p.status || act.status} compact />
                                                 </td>
                                               </tr>
                                             );

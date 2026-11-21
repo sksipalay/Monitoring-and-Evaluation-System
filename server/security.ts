@@ -559,11 +559,25 @@ export function computeProgramDiff(before: Program, after: Program): AuditChange
 
   check('AIP Ref Code', before.aipRefCode, after.aipRefCode);
   check('Program Title', before.title, after.title);
+  check('Target Outputs', before.targetOutputs || '', after.targetOutputs || '');
   check('Sector', before.sector, after.sector);
   check('Base Budget', before.budget ?? 0, after.budget ?? 0);
   check('Net Supplemental Budget', before.supplementalBudget ?? 0, after.supplementalBudget ?? 0);
+  const beforeLogs = before.supplementalLogs || [];
+  const afterLogs = after.supplementalLogs || [];
+  if (afterLogs.length > beforeLogs.length && afterLogs[0]) {
+    const latest = afterLogs[0];
+    const slotNum = latest.supplementalNumber || 1;
+    const sign = latest.type === 'SUBTRACT' ? '-' : '+';
+    diffs.push({
+      field: `Supplemental Budget ${slotNum}`,
+      before: '—',
+      after: `${sign}${latest.amount}`,
+    });
+  }
   check('Source of Fund', before.sourceOfFund || '', after.sourceOfFund || '');
   check('GAD Fund', Boolean(before.gadFund), Boolean(after.gadFund));
+  check('Accomplishment Status', before.status || 'PENDING', after.status || 'PENDING');
   check('Implementing Office', before.officeName, after.officeName);
   return diffs;
 }
@@ -588,6 +602,9 @@ export function computeActivityDiff(before: Activity, after: Activity): AuditCha
   check('CO Budget', before.co, after.co);
   check('Withheld Amount', before.withheldAmount, after.withheldAmount);
   check('Status', before.status, after.status);
+  if ((before.completionPct ?? 0) !== (after.completionPct ?? 0)) {
+    check('Completion %', `${before.completionPct ?? 0}%`, `${after.completionPct ?? 0}%`);
+  }
   check('Remarks', before.remarks, after.remarks);
   check('Start Date', before.startDate || '', after.startDate || '');
   check('End Date', before.endDate || '', after.endDate || '');
@@ -605,6 +622,19 @@ export function computeActivityDiff(before: Activity, after: Activity): AuditCha
       'Linked Tasks Progress',
       `${beforeCompleted}/${beforeMilestones.length} Completed`,
       `${afterCompleted}/${afterMilestones.length} Completed`
+    );
+  }
+
+  const beforeEvidence = before.evidence || [];
+  const afterEvidence = after.evidence || [];
+  if (
+    beforeEvidence.length !== afterEvidence.length ||
+    JSON.stringify(beforeEvidence) !== JSON.stringify(afterEvidence)
+  ) {
+    check(
+      'Supporting Evidence',
+      `${beforeEvidence.length} item(s)`,
+      `${afterEvidence.length} item(s)`
     );
   }
 

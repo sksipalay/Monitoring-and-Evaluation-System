@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clock,
   RotateCcw,
   Save,
@@ -17,6 +19,7 @@ import {
   UserRole,
 } from '../../types/ppa';
 import {
+  STATUS_OPTIONS,
   formatPHP,
   formatPct,
   resolveActivityBudgetDisplay,
@@ -31,11 +34,24 @@ interface AccomplishmentStatusModuleProps {
   selectedFiscalYear: string;
   userRole: UserRole;
   userUid: string;
+  onUpdateProgram?: (program: Program) => Promise<void>;
   onUpdateStatus: (
     activity: Activity,
     newStatus: ImplementationStatus,
-    remarks: string
+    remarks: string,
+    completionPct?: number
   ) => Promise<void>;
+}
+
+interface ActivityProgressDraft {
+  status: ImplementationStatus;
+  completionPct: number;
+  remarks: string;
+}
+
+function clampPct(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(Math.min(100, Math.max(0, value)) * 100) / 100;
 }
 
 function computeRemarksRows(text: string): number {
@@ -45,7 +61,7 @@ function computeRemarksRows(text: string): number {
   for (const line of lines) {
     visualLines += Math.max(1, Math.ceil(line.length / 42));
   }
-  return Math.max(3, Math.min(10, visualLines));
+  return Math.max(2, Math.min(8, visualLines));
 }
 
 export function AccomplishmentStatusModule({
@@ -55,12 +71,13 @@ export function AccomplishmentStatusModule({
   userRole,
   onUpdateStatus,
 }: AccomplishmentStatusModuleProps) {
-  const canEditRemarks = canEditStatusOrRemarks(userRole);
+  const canEditStatusRemarks = canEditStatusOrRemarks(userRole);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
-  const [remarksDrafts, setRemarksDrafts] = useState<Record<string, string>>({});
-  const [savingIds, setSavingIds] = useState<Record<string, boolean>>({});
-  const [savedIds, setSavedIds] = useState<Record<string, boolean>>({});
+  const [collapsedProgramIds, setCollapsedProgramIds] = useState<Record<string, boolean>>({});
+  const [drafts, setDrafts] = useState<Record<string, ActivityProgressDraft>>({});
+  const [savingActIds, setSavingActIds] = useState<Record<string, boolean>>({});
+  const [savedActIds, setSavedActIds] = useState<Record<string, boolean>>({});
   const savedTimersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -70,6 +87,14 @@ export function AccomplishmentStatusModule({
       }
     };
   }, []);
+
+  const fyPrograms = useMemo(
+    () =>
+      programs
+        .filter((p) => selectedFiscalYear === 'ALL' || p.fiscalYear === selectedFiscalYear)
+        .sort((a, b) => a.orderIndex - b.orderIndex || a.aipRefCode.localeCompare(b.aipRefCode)),
+    [programs, selectedFiscalYear]
+  );
 
   const fyActivities = useMemo(
     () =>
@@ -87,59 +112,150 @@ export function AccomplishmentStatusModule({
       PENDING: 0,
       'NOT IMPLEMENTED': 0,
     };
+    const pctSums: Record<ImplementationStatus, number> = {
+      COMPLETED: 0,
+      'ON-GOING': 0,
+      PENDING: 0,
+      'NOT IMPLEMENTED': 0,
+    };
     for (const a of fyActivities) {
-      map[a.status] = (map[a.status] || 0) + 1;
+      const st = a.status || 'PENDING';
+      map[st] = (map[st] || 0) + 1;
+      pctSums[st] = (pctSums[st] || 0) + clampPct(a.completionPct ?? 0);
     }
-    return { total, map };
+    return { total, map, pctSums };
   }, [fyActivities]);
 
-  const programMap = useMemo(
-    () => new Map(programs.map((p) => [p.id, p])),
-    [programs]
-  );
-
-  const programNameMap = useMemo(
-    () => new Map(programs.map((p) => [p.id, p.title])),
-    [programs]
-  );
+  const activitiesByProgram = useMemo(() => {
+    const map = new Map<string, ActivityComputed[]>();
+    for (const a of fyActivities) {
+      const list = map.get(a.programId);
+      if (list) list.push(a);
+      else map.set(a.programId, [a]);
+    }
+    return map;
+  }, [fyActivities]);
 
   const programSummaryMap = useMemo(
-    () => new Map(programs.map((p) => [p.id, summarizeProgram(p, activities)])),
-    [programs, activities]
+    () =>
+      new Map(
+        fyPrograms.map((p) => [p.id, summarizeProgram(p, activitiesByProgram.get(p.id) || [])])
+      ),
+    [fyPrograms, activitiesByProgram]
   );
 
-  const filtered = useMemo(() => {
+  const filteredPrograms = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return fyActivities.filter((a) => {
-      if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
-      if (q) {
-        const hay = `${a.referenceNumber} ${a.description} ${a.officeName} ${a.remarks || ''}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
-  }, [fyActivities, statusFilter, search]);
+    return fyPrograms
+      .map((p) => {
+        const progActs = activitiesByProgram.get(p.id) || [];
+        const matchingActs = progActs.filter((a) => {
+          const st = a.status || 'PENDING';
+          if (statusFilter !== 'ALL' && st !== statusFilter) return false;
+          if (q) {
+            const hay = `${p.aipRefCode} ${p.title} ${p.officeName} ${a.referenceNumber} ${a.description} ${a.remarks || ''} ${st}`.toLowerCase();
+            if (!hay.includes(q)) return false;
+          }
+          return true;
+        });
 
-  const handleRemarksChange = (id: string, value: string) => {
-    setRemarksDrafts((prev) => ({ ...prev, [id]: value }));
-    setSavedIds((prev) => {
-      if (!prev[id]) return prev;
+        const programMatchesQuery =
+          !q ||
+          `${p.aipRefCode} ${p.title} ${p.officeName} ${p.sourceOfFund || ''}`
+            .toLowerCase()
+            .includes(q);
+
+        if (statusFilter !== 'ALL') {
+          if (matchingActs.length === 0) return null;
+          return { program: p, activities: matchingActs };
+        }
+
+        if (q && !programMatchesQuery && matchingActs.length === 0) {
+          return null;
+        }
+
+        return {
+          program: p,
+          activities: q && !programMatchesQuery ? matchingActs : progActs,
+        };
+      })
+      .filter((item): item is { program: Program; activities: ActivityComputed[] } => item !== null);
+  }, [fyPrograms, statusFilter, search, activitiesByProgram]);
+
+  const anyExpanded = useMemo(
+    () =>
+      filteredPrograms.some(
+        ({ program, activities: pActs }) =>
+          pActs.length > 0 && !collapsedProgramIds[program.id]
+      ),
+    [filteredPrograms, collapsedProgramIds]
+  );
+
+  const handleToggleExpandAll = () => {
+    if (anyExpanded) {
+      const next: Record<string, boolean> = {};
+      for (const { program, activities: pActs } of filteredPrograms) {
+        if (pActs.length > 0) next[program.id] = true;
+      }
+      setCollapsedProgramIds(next);
+    } else {
+      setCollapsedProgramIds({});
+    }
+  };
+
+  const getDraft = (act: ActivityComputed): ActivityProgressDraft => {
+    const existing = drafts[act.id];
+    if (existing) return existing;
+    return {
+      status: act.status || 'PENDING',
+      completionPct: clampPct(act.completionPct ?? 0),
+      remarks: act.remarks || '',
+    };
+  };
+
+  const updateDraft = (
+    act: ActivityComputed,
+    patch: Partial<ActivityProgressDraft>
+  ) => {
+    setDrafts((prev) => {
+      const current = prev[act.id] ?? {
+        status: act.status || 'PENDING',
+        completionPct: clampPct(act.completionPct ?? 0),
+        remarks: act.remarks || '',
+      };
+      return {
+        ...prev,
+        [act.id]: { ...current, ...patch },
+      };
+    });
+    setSavedActIds((prev) => {
+      if (!prev[act.id]) return prev;
       const next = { ...prev };
-      delete next[id];
+      delete next[act.id];
       return next;
     });
   };
 
-  const handleSaveRemarks = async (act: ActivityComputed, overrideValue?: string) => {
-    if (savingIds[act.id]) return;
-    const rawDraft = overrideValue ?? remarksDrafts[act.id];
-    if (rawDraft === undefined) return;
+  const isActivityDirty = (act: ActivityComputed, draft: ActivityProgressDraft): boolean => {
+    const savedStatus = act.status || 'PENDING';
+    const savedPct = clampPct(act.completionPct ?? 0);
+    const savedRemarks = (act.remarks || '').replace(/\r\n/g, '\n');
+    const draftRemarks = draft.remarks.replace(/\r\n/g, '\n');
+    return (
+      draft.status !== savedStatus ||
+      clampPct(draft.completionPct) !== savedPct ||
+      draftRemarks !== savedRemarks
+    );
+  };
 
-    const normalizedNext = rawDraft.replace(/\r\n/g, '\n');
-    const normalizedCurrent = (act.remarks || '').replace(/\r\n/g, '\n');
-
-    if (normalizedNext === normalizedCurrent) {
-      setRemarksDrafts((prev) => {
+  const handleSaveActivityProgress = async (
+    act: ActivityComputed,
+    overrideDraft?: ActivityProgressDraft
+  ) => {
+    if (savingActIds[act.id]) return;
+    const draft = overrideDraft ?? getDraft(act);
+    if (!isActivityDirty(act, draft)) {
+      setDrafts((prev) => {
         if (!(act.id in prev)) return prev;
         const next = { ...prev };
         delete next[act.id];
@@ -148,20 +264,24 @@ export function AccomplishmentStatusModule({
       return;
     }
 
-    setSavingIds((prev) => ({ ...prev, [act.id]: true }));
+    const normalizedRemarks = draft.remarks.replace(/\r\n/g, '\n');
+    const normalizedPct = clampPct(draft.completionPct);
+
+    setSavingActIds((prev) => ({ ...prev, [act.id]: true }));
     try {
-      await onUpdateStatus(act, act.status, normalizedNext);
-      setRemarksDrafts((prev) => {
+      await onUpdateStatus(act, draft.status, normalizedRemarks, normalizedPct);
+      setDrafts((prev) => {
         const next = { ...prev };
         delete next[act.id];
         return next;
       });
-      setSavedIds((prev) => ({ ...prev, [act.id]: true }));
-      if (savedTimersRef.current[act.id]) {
-        window.clearTimeout(savedTimersRef.current[act.id]);
+      setSavedActIds((prev) => ({ ...prev, [act.id]: true }));
+      const timerKey = `act:${act.id}`;
+      if (savedTimersRef.current[timerKey]) {
+        window.clearTimeout(savedTimersRef.current[timerKey]);
       }
-      savedTimersRef.current[act.id] = window.setTimeout(() => {
-        setSavedIds((prev) => {
+      savedTimersRef.current[timerKey] = window.setTimeout(() => {
+        setSavedActIds((prev) => {
           const next = { ...prev };
           delete next[act.id];
           return next;
@@ -170,7 +290,7 @@ export function AccomplishmentStatusModule({
     } catch {
       /* Error notification handled in parent handler; keep user's draft intact */
     } finally {
-      setSavingIds((prev) => {
+      setSavingActIds((prev) => {
         const next = { ...prev };
         delete next[act.id];
         return next;
@@ -178,13 +298,17 @@ export function AccomplishmentStatusModule({
     }
   };
 
-  const handleDiscardRemarks = (id: string) => {
-    setRemarksDrafts((prev) => {
+  const handleDiscardDraft = (id: string) => {
+    setDrafts((prev) => {
       if (!(id in prev)) return prev;
       const next = { ...prev };
       delete next[id];
       return next;
     });
+  };
+
+  const toggleExpandProgram = (progId: string) => {
+    setCollapsedProgramIds((prev) => ({ ...prev, [progId]: !prev[progId] }));
   };
 
   const cards: {
@@ -226,11 +350,12 @@ export function AccomplishmentStatusModule({
 
   return (
     <div className="space-y-5">
-      {/* Status Distribution Summary */}
+      {/* Activity Completion Distribution Summary */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {cards.map(({ status, color, bg, border, Icon }) => {
           const count = counts.map[status];
-          const pct = counts.total > 0 ? (count / counts.total) * 100 : 0;
+          const sharePct = counts.total > 0 ? (count / counts.total) * 100 : 0;
+          const avgCompletion = count > 0 ? counts.pctSums[status] / count : 0;
           const isSelected = statusFilter === status;
           return (
             <button
@@ -249,14 +374,22 @@ export function AccomplishmentStatusModule({
                   <span>{status}</span>
                 </span>
                 <span className="font-mono text-xs font-medium text-slate-500 dark:text-slate-400 tabular-nums">
-                  {formatPct(pct)}
+                  {formatPct(sharePct)}
                 </span>
               </div>
-              <p className="mt-2 font-mono text-[28px] leading-tight font-semibold tracking-tight text-slate-900 dark:text-slate-100 tabular-nums">
-                {count}
-              </p>
+              <div className="mt-2 flex items-baseline justify-between gap-2">
+                <p className="font-mono text-[28px] leading-tight font-semibold tracking-tight text-slate-900 dark:text-slate-100 tabular-nums">
+                  {count}
+                </p>
+                {count > 0 && (
+                  <span className="font-mono text-xs font-medium text-slate-600 dark:text-slate-300 tabular-nums">
+                    Avg {formatPct(avgCompletion)}
+                  </span>
+                )}
+              </div>
               <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                Click to {isSelected ? 'show all statuses' : `filter ${status.toLowerCase()}`}
+                {count === 1 ? 'Activity' : 'Activities'} · Click to{' '}
+                {isSelected ? 'show all' : `filter ${status.toLowerCase()}`}
               </p>
             </button>
           );
@@ -271,155 +404,366 @@ export function AccomplishmentStatusModule({
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search reference code, activity, office, or remarks..."
+            placeholder="Search AIP ref, program, activity, office, or remarks..."
             className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 pl-9 pr-3 py-2 text-sm focus:border-[#2563EB] focus:outline-none"
           />
         </div>
-        <p className="text-xs text-slate-500 dark:text-slate-400">
-          Remarks support complete multi-line text and save automatically on blur or via Save Remarks.
-        </p>
+        <div className="flex flex-wrap items-center gap-3">
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Specify activity completion status and percentage complete (0%–100%) alongside remarks.
+          </p>
+          <button
+            type="button"
+            onClick={handleToggleExpandAll}
+            className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+          >
+            {anyExpanded ? 'Collapse All' : 'Expand All'}
+          </button>
+        </div>
       </div>
 
-      {/* Table */}
+      {/* Programs & Activity Completion Tracking Table */}
       <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-800/70 text-[12.5px] font-semibold text-slate-700 dark:text-slate-300">
-                <th className="py-3 px-4">Ref No.</th>
-                <th className="py-3 px-4">Project / Activity &amp; Program</th>
-                <th className="py-3 px-4 text-right">Accomplishment</th>
+                <th className="py-3 px-4 w-9" aria-label="Expand activity completion tracking" />
+                <th className="py-3 px-4">AIP Ref</th>
+                <th className="py-3 px-4">Program Title &amp; Implementing Office</th>
+                <th className="py-3 px-4 text-right">Activities</th>
                 <th className="py-3 px-4 text-right">Revised Budget</th>
+                <th className="py-3 px-4 text-right">Phys. %</th>
                 <th className="py-3 px-4 text-right">Fin. %</th>
-                <th className="py-3 px-4">Current Status</th>
-                <th className="py-3 px-4 min-w-[300px]">Remarks</th>
+                <th className="py-3 px-4 min-w-[180px]">Avg. Completion</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-[13px] text-slate-800 dark:text-slate-200">
-              {filtered.length === 0 ? (
+              {filteredPrograms.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="py-8 text-center text-sm text-slate-500 dark:text-slate-400">
-                    No activities found.
+                  <td colSpan={8} className="py-8 text-center text-sm text-slate-500 dark:text-slate-400">
+                    No programs or activities found for the selected filter.
                   </td>
                 </tr>
               ) : (
-                filtered.map((act) => {
-                  const parentProg = programMap.get(act.programId);
-                  const bd = resolveActivityBudgetDisplay(
-                    act,
-                    parentProg,
-                    programSummaryMap.get(act.programId)
-                  );
-                  const savedRemarks = act.remarks || '';
-                  const draftValue = remarksDrafts[act.id] ?? savedRemarks;
-                  const isDirty =
-                    remarksDrafts[act.id] !== undefined &&
-                    draftValue.replace(/\r\n/g, '\n') !== savedRemarks.replace(/\r\n/g, '\n');
-                  const isSaving = Boolean(savingIds[act.id]);
-                  const isSaved = Boolean(savedIds[act.id]);
+                filteredPrograms.map(({ program: prog, activities: progActs }) => {
+                  const progSummary = programSummaryMap.get(prog.id);
+                  const isExpanded = progActs.length > 0 && !collapsedProgramIds[prog.id];
+                  const avgCompletionPct =
+                    progActs.length > 0
+                      ? progActs.reduce((sum, a) => sum + clampPct(a.completionPct ?? 0), 0) /
+                        progActs.length
+                      : 0;
 
                   return (
-                    <tr key={act.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/50 align-top">
-                      <td className="py-3 px-4 font-mono text-xs font-medium text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                        {act.referenceNumber}
-                      </td>
-                      <td className="py-3 px-4">
-                        <div className="font-medium text-slate-900 dark:text-slate-100 leading-snug">
-                          {act.description}
-                        </div>
-                        <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                          {programNameMap.get(act.programId) || 'Program'} · {act.officeName}
-                        </div>
-                      </td>
-                      <td className="py-3 px-4 text-right font-mono font-medium text-[#163A5F] dark:text-sky-400 tabular-nums whitespace-nowrap">
-                        {formatPct(bd.accomplishmentPct)}
-                      </td>
-                      <td className="py-3 px-4 text-right font-mono tabular-nums whitespace-nowrap">
-                        {formatPHP(bd.revisedBudget)}
-                      </td>
-                      <td className="py-3 px-4 text-right font-mono font-medium tabular-nums whitespace-nowrap">
-                        {formatPct(act.financialAccomplishmentPct)}
-                      </td>
-                      <td className="py-3 px-4 whitespace-nowrap">
-                        <StatusBadge status={act.status} />
-                      </td>
-                      <td className="py-3 px-4 min-w-[300px] max-w-lg">
-                        <div className="space-y-1.5">
-                          <textarea
-                            aria-label={`Remarks for ${act.referenceNumber}`}
-                            rows={computeRemarksRows(draftValue)}
-                            value={draftValue}
-                            disabled={isSaving || !canEditRemarks}
-                            onChange={(e) => handleRemarksChange(act.id, e.target.value)}
-                            onBlur={(e) => {
-                              if (canEditRemarks && isDirty && !isSaving) {
-                                void handleSaveRemarks(act, e.currentTarget.value);
+                    <Fragment key={prog.id}>
+                      <tr className="hover:bg-slate-50 dark:hover:bg-slate-800/50 align-middle">
+                        <td className="py-3 px-4">
+                          {progActs.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => toggleExpandProgram(prog.id)}
+                              className="rounded-md p-1 text-slate-500 hover:bg-slate-200/70 dark:text-slate-400 dark:hover:bg-slate-700 transition-colors"
+                              aria-label={
+                                isExpanded
+                                  ? `Collapse activities under ${prog.title}`
+                                  : `Expand activities under ${prog.title}`
                               }
-                            }}
-                            onKeyDown={(e) => {
-                              if (canEditRemarks && (e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                                e.preventDefault();
-                                void handleSaveRemarks(act, e.currentTarget.value);
+                              title={
+                                isExpanded
+                                  ? 'Hide activity completion controls'
+                                  : 'Show activity completion controls'
                               }
-                            }}
-                            placeholder={
-                              canEditRemarks
-                                ? 'Enter detailed multi-line accomplishment remarks or observations...'
-                                : 'Read-only remarks'
-                            }
-                            className={`no-print w-full resize-y rounded-lg border px-3 py-2 text-[13px] leading-relaxed whitespace-pre-wrap break-words text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none transition-colors ${
-                              isDirty
-                                ? 'border-[#2563EB] bg-blue-50/30 dark:bg-sky-950/20'
-                                : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 focus:border-[#2563EB]'
-                            } disabled:opacity-60`}
-                          />
-                          <div className="hidden print:block text-[12px] leading-relaxed whitespace-pre-wrap break-words text-slate-800">
-                            {draftValue.trim() || '—'}
+                            >
+                              {isExpanded ? (
+                                <ChevronDown className="h-4 w-4" />
+                              ) : (
+                                <ChevronRight className="h-4 w-4" />
+                              )}
+                            </button>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 font-mono text-xs font-semibold text-[#163A5F] dark:text-sky-400 whitespace-nowrap">
+                          {prog.aipRefCode}
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-semibold text-slate-900 dark:text-slate-100 leading-snug">
+                            {prog.title}
                           </div>
-                          {canEditRemarks && (isDirty || isSaving || isSaved) && (
-                            <div className="no-print flex flex-wrap items-center justify-between gap-2">
-                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                                {isSaving
-                                  ? 'Saving remarks...'
-                                  : isSaved
-                                    ? 'Remarks saved'
-                                    : 'Unsaved changes (Ctrl+Enter or click outside to save)'}
+                          <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                            FY {prog.fiscalYear} · {prog.officeName}
+                            {prog.sourceOfFund ? ` · ${prog.sourceOfFund}` : ''}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 text-right font-mono font-medium tabular-nums whitespace-nowrap">
+                          {progActs.length}
+                        </td>
+                        <td className="py-3 px-4 text-right font-mono font-semibold tabular-nums whitespace-nowrap">
+                          {formatPHP(progSummary?.revisedBudget ?? 0)}
+                        </td>
+                        <td className="py-3 px-4 text-right font-mono font-medium text-[#163A5F] dark:text-sky-400 tabular-nums whitespace-nowrap">
+                          {progSummary && progSummary.annualPhysicalTarget > 0
+                            ? formatPct(progSummary.physicalAccomplishmentPct)
+                            : '—'}
+                        </td>
+                        <td className="py-3 px-4 text-right font-mono font-medium text-[#163A5F] dark:text-sky-400 tabular-nums whitespace-nowrap">
+                          {formatPct(progSummary?.budgetUtilizationPct ?? 0)}
+                        </td>
+                        <td className="py-3 px-4 whitespace-nowrap">
+                          {progActs.length === 0 ? (
+                            <span className="text-xs text-slate-400">—</span>
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <div className="h-2 flex-1 rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full transition-all ${
+                                    avgCompletionPct >= 100
+                                      ? 'bg-emerald-600 dark:bg-emerald-400'
+                                      : 'bg-[#163A5F] dark:bg-sky-400'
+                                  }`}
+                                  style={{ width: `${Math.min(100, Math.max(0, avgCompletionPct))}%` }}
+                                />
+                              </div>
+                              <span className="w-14 text-right font-mono text-xs font-semibold text-slate-700 dark:text-slate-300 tabular-nums">
+                                {formatPct(avgCompletionPct)}
                               </span>
-                              {isDirty && (
-                                <div className="flex items-center gap-1.5">
-                                  <button
-                                    type="button"
-                                    disabled={isSaving}
-                                    onMouseDown={(e) => e.preventDefault()}
-                                    onClick={() => handleDiscardRemarks(act.id)}
-                                    className="inline-flex items-center gap-1 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-[11px] font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
-                                  >
-                                    <RotateCcw className="h-3 w-3" aria-hidden="true" />
-                                    <span>Discard</span>
-                                  </button>
-                                  <button
-                                    type="button"
-                                    disabled={isSaving}
-                                    onMouseDown={(e) => e.preventDefault()}
-                                    onClick={() => void handleSaveRemarks(act)}
-                                    className="inline-flex items-center gap-1 rounded-md bg-[#163A5F] hover:bg-[#1E4D7B] dark:bg-[#2563EB] dark:hover:bg-[#1D4ED8] px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-50"
-                                  >
-                                    <Save className="h-3 w-3" aria-hidden="true" />
-                                    <span>{isSaving ? 'Saving...' : 'Save Remarks'}</span>
-                                  </button>
-                                </div>
-                              )}
-                              {!isDirty && isSaved && (
-                                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
-                                  <Check className="h-3.5 w-3.5" aria-hidden="true" />
-                                  <span>Saved</span>
-                                </span>
-                              )}
                             </div>
                           )}
-                        </div>
-                      </td>
-                    </tr>
+                        </td>
+                      </tr>
+
+                      {isExpanded && progActs.length > 0 && (
+                        <tr className="bg-slate-50/70 dark:bg-slate-800/30">
+                          <td colSpan={8} className="px-6 py-4">
+                            <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 overflow-hidden">
+                              <div className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/70 px-4 py-2 text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                Activity Completion Tracking &amp; Remarks ({progActs.length})
+                              </div>
+                              <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                                {progActs.map((act) => {
+                                  const bd = resolveActivityBudgetDisplay(act, prog, progSummary);
+                                  const draft = getDraft(act);
+                                  const isDirty = isActivityDirty(act, draft);
+                                  const isSavingAct = Boolean(savingActIds[act.id]);
+                                  const isSavedAct = Boolean(savedActIds[act.id]);
+
+                                  return (
+                                    <div
+                                      key={act.id}
+                                      className="p-4 grid grid-cols-1 lg:grid-cols-12 gap-4 items-start"
+                                    >
+                                      {/* Activity Summary */}
+                                      <div className="lg:col-span-4 space-y-1">
+                                        <p className="font-mono text-xs font-semibold text-[#2563EB] dark:text-sky-400">
+                                          {act.referenceNumber}
+                                        </p>
+                                        <p className="text-xs font-semibold text-slate-900 dark:text-slate-100 leading-snug">
+                                          {act.description}
+                                        </p>
+                                        <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                                          Expenditure: {formatPHP(bd.expenditure)} · Fin:{' '}
+                                          {formatPct(bd.accomplishmentPct)}
+                                        </p>
+                                      </div>
+
+                                      {/* Status + Percentage Complete */}
+                                      <div className="lg:col-span-4 space-y-2.5">
+                                        <div>
+                                          <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400 mb-1">
+                                            Completion Status
+                                          </label>
+                                          <div className="flex flex-wrap items-center gap-2">
+                                            {canEditStatusRemarks ? (
+                                              <select
+                                                aria-label={`Completion status for ${act.referenceNumber}`}
+                                                value={draft.status}
+                                                disabled={isSavingAct}
+                                                onChange={(e) => {
+                                                  const nextStatus = e.target
+                                                    .value as ImplementationStatus;
+                                                  const nextPct =
+                                                    nextStatus === 'COMPLETED' &&
+                                                    draft.completionPct === 0
+                                                      ? 100
+                                                      : draft.completionPct;
+                                                  updateDraft(act, {
+                                                    status: nextStatus,
+                                                    completionPct: nextPct,
+                                                  });
+                                                }}
+                                                className="no-print rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2.5 py-1.5 text-xs font-semibold text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:opacity-50"
+                                              >
+                                                {STATUS_OPTIONS.map((s) => (
+                                                  <option key={s} value={s}>
+                                                    {s}
+                                                  </option>
+                                                ))}
+                                              </select>
+                                            ) : null}
+                                            <StatusBadge status={draft.status} compact />
+                                          </div>
+                                        </div>
+
+                                        <div>
+                                          <div className="flex items-center justify-between gap-2 mb-1">
+                                            <label
+                                              htmlFor={`pct-${act.id}`}
+                                              className="text-[11px] font-medium text-slate-600 dark:text-slate-400"
+                                            >
+                                              Percentage Complete
+                                            </label>
+                                            <div className="flex items-center gap-1">
+                                              <input
+                                                id={`pct-${act.id}`}
+                                                type="number"
+                                                min={0}
+                                                max={100}
+                                                step={1}
+                                                value={draft.completionPct}
+                                                disabled={isSavingAct || !canEditStatusRemarks}
+                                                onChange={(e) => {
+                                                  const raw = e.target.value;
+                                                  const parsed = raw === '' ? 0 : Number(raw);
+                                                  updateDraft(act, {
+                                                    completionPct: clampPct(parsed),
+                                                  });
+                                                }}
+                                                className="no-print w-16 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-0.5 text-right font-mono text-xs font-semibold text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:opacity-60"
+                                                aria-label={`Percentage complete for ${act.referenceNumber}`}
+                                              />
+                                              <span className="font-mono text-xs font-semibold text-slate-600 dark:text-slate-300">
+                                                %
+                                              </span>
+                                            </div>
+                                          </div>
+                                          {canEditStatusRemarks && (
+                                            <input
+                                              type="range"
+                                              min={0}
+                                              max={100}
+                                              step={1}
+                                              value={draft.completionPct}
+                                              disabled={isSavingAct}
+                                              onChange={(e) =>
+                                                updateDraft(act, {
+                                                  completionPct: clampPct(Number(e.target.value)),
+                                                })
+                                              }
+                                              aria-label={`Percentage complete slider for ${act.referenceNumber}`}
+                                              className="no-print w-full accent-[#163A5F] dark:accent-sky-400 cursor-pointer h-1.5"
+                                            />
+                                          )}
+                                          <div className="mt-1 h-2 w-full rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
+                                            <div
+                                              className={`h-full rounded-full transition-all ${
+                                                draft.completionPct >= 100
+                                                  ? 'bg-emerald-600 dark:bg-emerald-400'
+                                                  : draft.completionPct > 0
+                                                    ? 'bg-[#2563EB] dark:bg-sky-400'
+                                                    : 'bg-slate-400 dark:bg-slate-600'
+                                              }`}
+                                              style={{ width: `${clampPct(draft.completionPct)}%` }}
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
+
+                                      {/* Remarks + Save Controls */}
+                                      <div className="lg:col-span-4 space-y-1.5">
+                                        <label
+                                          htmlFor={`rem-${act.id}`}
+                                          className="block text-[11px] font-medium text-slate-600 dark:text-slate-400"
+                                        >
+                                          Activity Remarks
+                                        </label>
+                                        <textarea
+                                          id={`rem-${act.id}`}
+                                          aria-label={`Remarks for ${act.referenceNumber}`}
+                                          rows={computeRemarksRows(draft.remarks)}
+                                          value={draft.remarks}
+                                          disabled={isSavingAct || !canEditStatusRemarks}
+                                          onChange={(e) =>
+                                            updateDraft(act, { remarks: e.target.value })
+                                          }
+                                          onKeyDown={(e) => {
+                                            if (
+                                              canEditStatusRemarks &&
+                                              (e.metaKey || e.ctrlKey) &&
+                                              e.key === 'Enter'
+                                            ) {
+                                              e.preventDefault();
+                                              void handleSaveActivityProgress(act, {
+                                                ...draft,
+                                                remarks: e.currentTarget.value,
+                                              });
+                                            }
+                                          }}
+                                          placeholder={
+                                            canEditStatusRemarks
+                                              ? 'Enter multi-line remarks or progress notes...'
+                                              : 'Read-only remarks'
+                                          }
+                                          className={`no-print w-full resize-y rounded-lg border px-3 py-2 text-xs leading-relaxed whitespace-pre-wrap break-words text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none transition-colors ${
+                                            isDirty
+                                              ? 'border-[#2563EB] bg-blue-50/30 dark:bg-sky-950/20'
+                                              : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 focus:border-[#2563EB]'
+                                          } disabled:opacity-60`}
+                                        />
+                                        <div className="hidden print:block text-xs leading-relaxed whitespace-pre-wrap break-words text-slate-800">
+                                          {draft.remarks.trim() || '—'}
+                                        </div>
+                                        {canEditStatusRemarks &&
+                                          (isDirty || isSavingAct || isSavedAct) && (
+                                            <div className="no-print flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                                                {isSavingAct
+                                                  ? 'Saving progress...'
+                                                  : isSavedAct
+                                                    ? 'Progress saved'
+                                                    : 'Unsaved changes (Ctrl+Enter or click Save)'}
+                                              </span>
+                                              {isDirty && (
+                                                <div className="flex items-center gap-1.5">
+                                                  <button
+                                                    type="button"
+                                                    disabled={isSavingAct}
+                                                    onClick={() => handleDiscardDraft(act.id)}
+                                                    className="inline-flex items-center gap-1 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-[11px] font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
+                                                  >
+                                                    <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                                                    <span>Discard</span>
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    disabled={isSavingAct}
+                                                    onClick={() => void handleSaveActivityProgress(act)}
+                                                    className="inline-flex items-center gap-1 rounded-md bg-[#163A5F] hover:bg-[#1E4D7B] dark:bg-[#2563EB] dark:hover:bg-[#1D4ED8] px-2.5 py-1 text-[11px] font-semibold text-white disabled:opacity-50"
+                                                  >
+                                                    <Save className="h-3 w-3" aria-hidden="true" />
+                                                    <span>
+                                                      {isSavingAct ? 'Saving...' : 'Save Progress'}
+                                                    </span>
+                                                  </button>
+                                                </div>
+                                              )}
+                                              {!isDirty && isSavedAct && (
+                                                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                                                  <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                                                  <span>Saved</span>
+                                                </span>
+                                              )}
+                                            </div>
+                                          )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   );
                 })
               )}

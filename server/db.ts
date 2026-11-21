@@ -147,6 +147,7 @@ export class AppDatabase {
         fiscal_year TEXT NOT NULL,
         aip_ref_code TEXT NOT NULL,
         title TEXT NOT NULL,
+        target_outputs TEXT NOT NULL DEFAULT '',
         sector TEXT NOT NULL,
         budget REAL NOT NULL DEFAULT 0,
         supplemental_budget REAL NOT NULL DEFAULT 0,
@@ -155,6 +156,7 @@ export class AppDatabase {
         monthly_physical_target_json TEXT NOT NULL DEFAULT '{}',
         source_of_fund TEXT NOT NULL DEFAULT '',
         gad_fund INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'PENDING',
         office_id TEXT NOT NULL,
         office_name TEXT NOT NULL,
         parent_program_id TEXT,
@@ -187,8 +189,10 @@ export class AppDatabase {
         supplemental_budget_5 REAL NOT NULL DEFAULT 0,
         monthly_json TEXT NOT NULL,
         status TEXT NOT NULL,
+        completion_pct REAL NOT NULL DEFAULT 0,
         remarks TEXT NOT NULL DEFAULT '',
         milestones_json TEXT NOT NULL DEFAULT '[]',
+        evidence_json TEXT NOT NULL DEFAULT '[]',
         order_index INTEGER NOT NULL DEFAULT 0,
         start_date TEXT NOT NULL DEFAULT '',
         end_date TEXT NOT NULL DEFAULT '',
@@ -347,11 +351,47 @@ export class AppDatabase {
     addUserCol('allowed_modules_json', "TEXT NOT NULL DEFAULT ''");
     addUserCol('privacy_consent_at', "TEXT NOT NULL DEFAULT ''");
 
+    const programCols = (
+      this.db.prepare('PRAGMA table_info(programs)').all() as { name: string }[]
+    ).map((c) => c.name);
+    if (!programCols.includes('target_outputs')) {
+      this.db.exec("ALTER TABLE programs ADD COLUMN target_outputs TEXT NOT NULL DEFAULT ''");
+    }
+    if (!programCols.includes('status')) {
+      this.db.exec("ALTER TABLE programs ADD COLUMN status TEXT NOT NULL DEFAULT 'PENDING'");
+      // Backfill program status from existing child activities once upon schema upgrade
+      const progRows = this.db.prepare('SELECT id FROM programs').all() as { id: string }[];
+      const actStmt = this.db.prepare(
+        'SELECT status FROM activities WHERE program_id = ? OR subprogram_id = ?'
+      );
+      const updStmt = this.db.prepare('UPDATE programs SET status = ? WHERE id = ?');
+      for (const pr of progRows) {
+        const acts = actStmt.all(pr.id, pr.id) as { status: string }[];
+        if (acts.length === 0) continue;
+        const statuses = acts.map((a) => String(a.status || 'PENDING'));
+        let derived: ImplementationStatus = 'PENDING';
+        if (statuses.every((s) => s === 'COMPLETED')) {
+          derived = 'COMPLETED';
+        } else if (statuses.every((s) => s === 'NOT IMPLEMENTED')) {
+          derived = 'NOT IMPLEMENTED';
+        } else if (statuses.some((s) => s === 'ON-GOING' || s === 'COMPLETED')) {
+          derived = 'ON-GOING';
+        }
+        updStmt.run(derived, pr.id);
+      }
+    }
+
     const activityCols = (
       this.db.prepare('PRAGMA table_info(activities)').all() as { name: string }[]
     ).map((c) => c.name);
     if (!activityCols.includes('milestones_json')) {
       this.db.exec("ALTER TABLE activities ADD COLUMN milestones_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!activityCols.includes('completion_pct')) {
+      this.db.exec('ALTER TABLE activities ADD COLUMN completion_pct REAL NOT NULL DEFAULT 0');
+    }
+    if (!activityCols.includes('evidence_json')) {
+      this.db.exec("ALTER TABLE activities ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'");
     }
 
     const sessionCols = (
@@ -536,17 +576,18 @@ export class AppDatabase {
     this.db
       .prepare(
         `INSERT INTO programs (
-          id, fiscal_year, aip_ref_code, title, sector, budget, supplemental_budget,
+          id, fiscal_year, aip_ref_code, title, target_outputs, sector, budget, supplemental_budget,
           supplemental_logs_json, physical_target, monthly_physical_target_json,
-          source_of_fund, gad_fund, office_id, office_name, parent_program_id,
+          source_of_fund, gad_fund, status, office_id, office_name, parent_program_id,
           order_index, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         p.id,
         p.fiscalYear,
         p.aipRefCode,
         p.title,
+        p.targetOutputs || '',
         p.sector || 'General Public Services',
         p.budget ?? 0,
         p.supplementalBudget ?? 0,
@@ -555,6 +596,7 @@ export class AppDatabase {
         JSON.stringify(p.monthlyPhysicalTarget || {}),
         p.sourceOfFund || '',
         p.gadFund ? 1 : 0,
+        p.status || 'PENDING',
         p.officeId,
         p.officeName,
         p.parentProgramId ?? null,
@@ -573,9 +615,9 @@ export class AppDatabase {
           gf, ps, mooe, co, withheld_amount,
           supplemental_budget_1, supplemental_budget_2, supplemental_budget_3,
           supplemental_budget_4, supplemental_budget_5,
-          monthly_json, status, remarks, milestones_json, order_index, start_date, end_date,
+          monthly_json, status, completion_pct, remarks, milestones_json, evidence_json, order_index, start_date, end_date,
           created_by, updated_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         a.id,
@@ -601,8 +643,10 @@ export class AppDatabase {
         a.supplementalBudget5 ?? 0,
         JSON.stringify(a.monthly),
         a.status || 'PENDING',
+        Math.min(100, Math.max(0, Number(a.completionPct ?? 0))),
         a.remarks || '',
         JSON.stringify(a.milestones || []),
+        JSON.stringify(a.evidence || []),
         a.orderIndex ?? 0,
         a.startDate || '',
         a.endDate || '',
@@ -870,6 +914,7 @@ export class AppDatabase {
       fiscalYear: String(r.fiscal_year),
       aipRefCode: String(r.aip_ref_code),
       title: String(r.title),
+      targetOutputs: String(r.target_outputs || ''),
       sector: String(r.sector),
       budget: Number(r.budget ?? 0),
       supplementalBudget: Number(r.supplemental_budget ?? 0),
@@ -878,6 +923,7 @@ export class AppDatabase {
       monthlyPhysicalTarget: monthlyPhys,
       sourceOfFund: String(r.source_of_fund || ''),
       gadFund: Boolean(r.gad_fund),
+      status: (String(r.status || 'PENDING') as ImplementationStatus),
       officeId: String(r.office_id),
       officeName: String(r.office_name),
       parentProgramId: r.parent_program_id ? String(r.parent_program_id) : null,
@@ -894,6 +940,13 @@ export class AppDatabase {
       if (Array.isArray(parsed)) milestones = parsed as ActivityMilestone[];
     } catch {
       milestones = [];
+    }
+    let evidence: Activity['evidence'] = [];
+    try {
+      const parsedEv = JSON.parse(String(r.evidence_json || '[]'));
+      if (Array.isArray(parsedEv)) evidence = parsedEv as NonNullable<Activity['evidence']>;
+    } catch {
+      evidence = [];
     }
     return {
       id: String(r.id),
@@ -919,8 +972,10 @@ export class AppDatabase {
       supplementalBudget5: Number(r.supplemental_budget_5 ?? 0),
       monthly: JSON.parse(String(r.monthly_json)) as Activity['monthly'],
       status: String(r.status) as ImplementationStatus,
+      completionPct: Math.min(100, Math.max(0, Number(r.completion_pct ?? 0))),
       remarks: String(r.remarks || ''),
       milestones,
+      evidence,
       orderIndex: Number(r.order_index ?? 0),
       startDate: String(r.start_date || ''),
       endDate: String(r.end_date || ''),
@@ -1140,6 +1195,10 @@ export class AppDatabase {
     pageSize?: number;
     action?: string;
     search?: string;
+    userUid?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    tzOffsetMinutes?: number;
     allowedUids?: Set<string> | null;
   }): {
     auditLogs: AuditLog[];
@@ -1156,6 +1215,30 @@ export class AppDatabase {
     if (params.action && params.action !== 'ALL') {
       conditions.push('action = ?');
       args.push(params.action);
+    }
+    if (params.userUid && params.userUid !== 'ALL') {
+      conditions.push('user_uid = ?');
+      args.push(params.userUid);
+    }
+    const tzOffsetMs =
+      typeof params.tzOffsetMinutes === 'number' && Number.isFinite(params.tzOffsetMinutes)
+        ? params.tzOffsetMinutes * 60_000
+        : 0;
+    if (params.dateFrom && params.dateFrom.trim()) {
+      const df = params.dateFrom.trim();
+      const baseMs = Date.parse(`${df}T00:00:00.000Z`);
+      if (Number.isFinite(baseMs)) {
+        conditions.push('timestamp >= ?');
+        args.push(new Date(baseMs + tzOffsetMs).toISOString());
+      }
+    }
+    if (params.dateTo && params.dateTo.trim()) {
+      const dt = params.dateTo.trim();
+      const baseMs = Date.parse(`${dt}T23:59:59.999Z`);
+      if (Number.isFinite(baseMs)) {
+        conditions.push('timestamp <= ?');
+        args.push(new Date(baseMs + tzOffsetMs).toISOString());
+      }
     }
     if (params.search && params.search.trim()) {
       const like = `%${params.search.trim().toLowerCase()}%`;
@@ -2018,13 +2101,15 @@ export class AppDatabase {
         throw this.makeHttpError(400, 'Implementing office referenced by this program does not exist.');
       }
 
+      const nextStatus = p.status || existing.status || 'PENDING';
+
       this.db
         .prepare(
           `UPDATE programs SET
-            fiscal_year = ?, aip_ref_code = ?, title = ?, sector = ?,
+            fiscal_year = ?, aip_ref_code = ?, title = ?, target_outputs = ?, sector = ?,
             budget = ?, supplemental_budget = ?, supplemental_logs_json = ?,
             physical_target = ?, monthly_physical_target_json = ?,
-            source_of_fund = ?, gad_fund = ?, office_id = ?, office_name = ?,
+            source_of_fund = ?, gad_fund = ?, status = ?, office_id = ?, office_name = ?,
             parent_program_id = ?, order_index = ?, updated_at = ?
            WHERE id = ?`
         )
@@ -2032,6 +2117,7 @@ export class AppDatabase {
           p.fiscalYear,
           p.aipRefCode,
           p.title,
+          p.targetOutputs || '',
           p.sector,
           p.budget ?? 0,
           p.supplementalBudget ?? 0,
@@ -2040,6 +2126,7 @@ export class AppDatabase {
           JSON.stringify(p.monthlyPhysicalTarget || {}),
           p.sourceOfFund || '',
           p.gadFund ? 1 : 0,
+          nextStatus,
           p.officeId,
           p.officeName,
           p.parentProgramId ?? null,
@@ -2047,6 +2134,13 @@ export class AppDatabase {
           p.updatedAt,
           p.id
         );
+
+      if ((existing.status || 'PENDING') !== nextStatus) {
+        this.db
+          .prepare('UPDATE activities SET status = ? WHERE program_id = ? OR subprogram_id = ?')
+          .run(nextStatus, p.id, p.id);
+      }
+
       return this.insertAuditLogRow(auditEntry);
     });
   }
@@ -2131,7 +2225,7 @@ export class AppDatabase {
             gf = ?, ps = ?, mooe = ?, co = ?, withheld_amount = ?,
             supplemental_budget_1 = ?, supplemental_budget_2 = ?, supplemental_budget_3 = ?,
             supplemental_budget_4 = ?, supplemental_budget_5 = ?,
-            monthly_json = ?, status = ?, remarks = ?, milestones_json = ?, order_index = ?,
+            monthly_json = ?, status = ?, completion_pct = ?, remarks = ?, milestones_json = ?, evidence_json = ?, order_index = ?,
             start_date = ?, end_date = ?, updated_by = ?, updated_at = ?
            WHERE id = ?`
         )
@@ -2158,8 +2252,10 @@ export class AppDatabase {
           a.supplementalBudget5,
           JSON.stringify(a.monthly),
           a.status,
+          Math.min(100, Math.max(0, Number(a.completionPct ?? 0))),
           a.remarks || '',
           JSON.stringify(a.milestones || []),
+          JSON.stringify(a.evidence || []),
           a.orderIndex ?? 0,
           a.startDate || '',
           a.endDate || '',

@@ -25,6 +25,8 @@ import {
   formatQty,
   resolveActivityBudgetDisplay,
   round2,
+  safeNum,
+  sumMonthlyPhysicalTargets,
   summarizeProgram,
 } from './calculations';
 
@@ -154,13 +156,19 @@ export function sanitizeCsvOrSpreadsheetText(raw: unknown): string {
 
 export function filterActivitiesForReport(
   reportType: ReportType,
-  activities: ActivityComputed[]
+  activities: ActivityComputed[],
+  programs?: Program[]
 ): ActivityComputed[] {
+  const progMap = programs ? new Map(programs.map((p) => [p.id, p])) : null;
+  const resolveStatus = (a: ActivityComputed) => progMap?.get(a.programId)?.status || a.status;
   if (reportType === 'completed_activities') {
-    return activities.filter((a) => a.status === 'COMPLETED');
+    return activities.filter((a) => resolveStatus(a) === 'COMPLETED');
   }
   if (reportType === 'pending_not_implemented') {
-    return activities.filter((a) => a.status === 'PENDING' || a.status === 'NOT IMPLEMENTED');
+    return activities.filter((a) => {
+      const st = resolveStatus(a);
+      return st === 'PENDING' || st === 'NOT IMPLEMENTED';
+    });
   }
   return activities;
 }
@@ -175,7 +183,7 @@ export function buildReportTableData(options: {
   const { reportType, monthKey, programs, activities } = options;
   const def = REPORT_DEFINITIONS.find((r) => r.id === reportType) || REPORT_DEFINITIONS[0];
   const monthObj = MONTHS.find((m) => m.key === monthKey) || MONTHS[0];
-  const filteredActivities = filterActivitiesForReport(reportType, activities);
+  const filteredActivities = filterActivitiesForReport(reportType, activities, programs);
   const summary = computeDashboardSummary(programs, filteredActivities);
 
   if (reportType === 'program_level') {
@@ -198,6 +206,7 @@ export function buildReportTableData(options: {
         'Remaining Budget',
         'Physical %',
         'Financial %',
+        'Status',
       ],
       alignments: [
         'left',
@@ -210,6 +219,7 @@ export function buildReportTableData(options: {
         'right',
         'right',
         'right',
+        'left',
       ],
       rows: rowsData.map((s) => [
         s.program.aipRefCode,
@@ -222,6 +232,7 @@ export function buildReportTableData(options: {
         formatPHP(s.remainingBudget),
         formatPct(s.physicalAccomplishmentPct),
         formatPct(s.financialAccomplishmentPct),
+        s.program.status || 'PENDING',
       ]),
       foot: [
         'TOTAL',
@@ -234,6 +245,7 @@ export function buildReportTableData(options: {
         formatPHP(totRemaining),
         formatPct(summary.overallPhysicalPct),
         formatPct(summary.overallFinancialPct),
+        '',
       ],
       emptyMessage: 'No programs match the selected fiscal year or filters.',
     };
@@ -301,6 +313,11 @@ export function buildReportTableData(options: {
     };
   }
 
+  const programLookup = new Map(programs.map((p) => [p.id, p]));
+  const programSumLookup = new Map(
+    programs.map((p) => [p.id, summarizeProgram(p, filteredActivities)])
+  );
+
   if (reportType === 'monthly_accomplishment') {
     let totPT = 0;
     let totPA = 0;
@@ -308,7 +325,15 @@ export function buildReportTableData(options: {
     let totFA = 0;
     const rows = filteredActivities.map((a) => {
       const m = a.monthly[monthKey];
-      totPT += m.physicalTarget;
+      const parentProg = programLookup.get(a.programId);
+      const useProgPT =
+        a.annualPhysicalTarget === 0 &&
+        Boolean(parentProg) &&
+        sumMonthlyPhysicalTargets(parentProg?.monthlyPhysicalTarget) > 0;
+      const effPT = useProgPT
+        ? Math.max(0, safeNum(parentProg?.monthlyPhysicalTarget?.[monthKey]))
+        : m.physicalTarget;
+      totPT += effPT;
       totPA += m.physicalActual;
       totFT += m.financialTarget;
       totFA += m.financialActual;
@@ -316,13 +341,15 @@ export function buildReportTableData(options: {
         a.referenceNumber,
         a.description,
         a.officeName,
-        formatQty(m.physicalTarget),
+        formatQty(effPT),
         formatQty(m.physicalActual),
         formatPHP(m.financialTarget),
         formatPHP(m.financialActual),
-        a.status,
+        parentProg?.status || a.status,
       ];
     });
+    const monthSummaryEntry = summary.monthlySeries.find((s) => s.monthKey === monthKey);
+    const effectiveTotPT = monthSummaryEntry ? monthSummaryEntry.physicalTarget : totPT;
     return {
       title: def.title,
       headers: [
@@ -341,7 +368,7 @@ export function buildReportTableData(options: {
         'TOTAL',
         `${filteredActivities.length} Activity(ies)`,
         monthObj.label,
-        formatQty(totPT),
+        formatQty(effectiveTotPT),
         formatQty(totPA),
         formatPHP(round2(totFT)),
         formatPHP(round2(totFA)),
@@ -350,11 +377,6 @@ export function buildReportTableData(options: {
       emptyMessage: 'No matching activities for the selected month and filters.',
     };
   }
-
-  const programLookup = new Map(programs.map((p) => [p.id, p]));
-  const programSumLookup = new Map(
-    programs.map((p) => [p.id, summarizeProgram(p, filteredActivities)])
-  );
 
   if (reportType === 'budget_utilization') {
     return {
@@ -436,16 +458,28 @@ export function buildReportTableData(options: {
         'Status',
       ],
       alignments: ['left', 'left', 'left', 'left', 'right', 'right', 'right', 'left'],
-      rows: filteredActivities.map((a) => [
-        a.referenceNumber,
-        a.description,
-        a.targetOutputs || '',
-        a.officeName,
-        formatQty(a.annualPhysicalTarget),
-        formatQty(a.annualPhysicalActual),
-        formatPct(a.physicalAccomplishmentPct),
-        a.status,
-      ]),
+      rows: filteredActivities.map((a) => {
+        const parentProg = programLookup.get(a.programId);
+        const progMonthlySum = parentProg
+          ? sumMonthlyPhysicalTargets(parentProg.monthlyPhysicalTarget)
+          : 0;
+        const effAnnPT =
+          a.annualPhysicalTarget === 0 && progMonthlySum > 0
+            ? progMonthlySum
+            : a.annualPhysicalTarget;
+        const effPhysPct =
+          effAnnPT > 0 ? round2((a.annualPhysicalActual / effAnnPT) * 100) : 0;
+        return [
+          a.referenceNumber,
+          a.description,
+          a.targetOutputs || '',
+          a.officeName,
+          formatQty(effAnnPT),
+          formatQty(a.annualPhysicalActual),
+          formatPct(effPhysPct),
+          parentProg?.status || a.status,
+        ];
+      }),
       foot: [
         'TOTAL',
         `${filteredActivities.length} Activity(ies)`,
@@ -490,7 +524,7 @@ export function buildReportTableData(options: {
           formatPHP(a.annualFinancialActual),
           formatPHP(round2(a.annualFinancialTarget - a.annualFinancialActual)),
           formatPct(a.financialAccomplishmentPct),
-          a.status,
+          programLookup.get(a.programId)?.status || a.status,
         ];
       }),
       foot: [
@@ -556,7 +590,7 @@ export function buildReportTableData(options: {
         formatPHP(bd.remainingBudget),
         formatPct(a.physicalAccomplishmentPct),
         formatPct(a.financialAccomplishmentPct),
-        a.status,
+        programLookup.get(a.programId)?.status || a.status,
         a.remarks || '',
       ];
     }),
@@ -812,7 +846,7 @@ export function buildTemplatePlaceholderContext(options: {
   const { reportType, fiscalYear, monthKey, programs, activities, settings } = options;
   const def = REPORT_DEFINITIONS.find((r) => r.id === reportType) || REPORT_DEFINITIONS[0];
   const monthObj = MONTHS.find((m) => m.key === monthKey) || MONTHS[0];
-  const filteredActivities = filterActivitiesForReport(reportType, activities);
+  const filteredActivities = filterActivitiesForReport(reportType, activities, programs);
   const summary = computeDashboardSummary(programs, filteredActivities);
   const gad = computeGadComplianceSummary(programs, filteredActivities);
 
@@ -854,7 +888,7 @@ export function buildTemplatePlaceholderContext(options: {
             monthPhysicalActual: '',
             monthFinancialTarget: '',
             monthFinancialActual: '',
-            status: s.budgetUtilizationPct >= 100 ? 'COMPLETED' : 'ON-GOING',
+            status: p.status || 'PENDING',
             remarks: '',
           };
         })
@@ -893,7 +927,7 @@ export function buildTemplatePlaceholderContext(options: {
               monthPhysicalActual: '',
               monthFinancialTarget: '',
               monthFinancialActual: '',
-              status: s.budgetUtilizationPct >= 100 ? 'COMPLETED' : 'ON-GOING',
+              status: s.program.status || 'PENDING',
               remarks: '',
             };
           })
@@ -901,6 +935,14 @@ export function buildTemplatePlaceholderContext(options: {
           const prog = progMap.get(a.programId);
           const bd = resolveActivityBudgetDisplay(a, prog, progSumMap.get(a.programId));
           const m = a.monthly[monthKey];
+          const progMonthlySum = prog ? sumMonthlyPhysicalTargets(prog.monthlyPhysicalTarget) : 0;
+          const useProgPT = a.annualPhysicalTarget === 0 && progMonthlySum > 0 && Boolean(prog);
+          const effAnnPT = useProgPT ? progMonthlySum : a.annualPhysicalTarget;
+          const effPhysPct =
+            effAnnPT > 0 ? round2((a.annualPhysicalActual / effAnnPT) * 100) : 0;
+          const effMonthPT = useProgPT
+            ? Math.max(0, safeNum(prog?.monthlyPhysicalTarget?.[monthKey]))
+            : m.physicalTarget;
           return {
             index: idx + 1,
             referenceNumber: a.referenceNumber,
@@ -919,18 +961,18 @@ export function buildTemplatePlaceholderContext(options: {
             revisedBudget: formatPHP(bd.revisedBudget),
             expenditure: formatPHP(bd.expenditure),
             remainingBudget: formatPHP(bd.remainingBudget),
-            physicalTarget: formatQty(a.annualPhysicalTarget),
+            physicalTarget: formatQty(effAnnPT),
             physicalActual: formatQty(a.annualPhysicalActual),
-            physicalPct: formatPct(a.physicalAccomplishmentPct),
+            physicalPct: formatPct(effPhysPct),
             financialTarget: formatPHP(a.annualFinancialTarget),
             financialActual: formatPHP(a.annualFinancialActual),
             financialPct: formatPct(a.financialAccomplishmentPct),
             utilizationPct: formatPct(bd.utilizationPct),
-            monthPhysicalTarget: formatQty(m.physicalTarget),
+            monthPhysicalTarget: formatQty(effMonthPT),
             monthPhysicalActual: formatQty(m.physicalActual),
             monthFinancialTarget: formatPHP(m.financialTarget),
             monthFinancialActual: formatPHP(m.financialActual),
-            status: a.status,
+            status: prog?.status || a.status,
             remarks: a.remarks || '',
           };
         });

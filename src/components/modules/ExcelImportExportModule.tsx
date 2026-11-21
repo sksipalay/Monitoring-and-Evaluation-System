@@ -633,7 +633,7 @@ export function ExcelImportExportModule({
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-800 dark:text-slate-200">
                 {parseResult.rows.map((r) => {
-                  const approved = r.ps + r.mooe + r.co;
+                  const approved = r.gf + r.ps + r.mooe + r.co;
                   return (
                     <tr key={r.rowNumber} className="hover:bg-slate-50 dark:hover:bg-slate-800/50">
                       <td className="py-2 px-3 font-mono text-slate-500 dark:text-slate-400">{r.rowNumber}</td>

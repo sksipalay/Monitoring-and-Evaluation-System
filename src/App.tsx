@@ -136,6 +136,18 @@ function getInitials(name: string): string {
   return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
 }
 
+function formatPrintTimestamp(date = new Date()): string {
+  return date.toLocaleString('en-PH', {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  });
+}
+
 export default function App() {
   const [db, setDb] = useState<DatabasePayload>({
     users: DEFAULT_USERS,
@@ -199,6 +211,13 @@ export default function App() {
   const [savingForcePw, setSavingForcePw] = useState(false);
   const lastActivityRef = useRef<number>(Date.now());
   const idleWarnedRef = useRef<boolean>(false);
+  const [printTimestamp, setPrintTimestamp] = useState<string>(() => formatPrintTimestamp());
+
+  useEffect(() => {
+    const updateTimestamp = () => setPrintTimestamp(formatPrintTimestamp());
+    window.addEventListener('beforeprint', updateTimestamp);
+    return () => window.removeEventListener('beforeprint', updateTimestamp);
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(sidebarCollapsed));
@@ -389,7 +408,7 @@ export default function App() {
 
     const matchingPrograms = scopedPrograms
       .filter((p) =>
-        `${p.aipRefCode} ${p.title} ${p.sector} ${p.officeName} ${p.fiscalYear}`
+        `${p.aipRefCode} ${p.title} ${p.targetOutputs || ''} ${p.sector} ${p.officeName} ${p.fiscalYear}`
           .toLowerCase()
           .includes(q)
       )
@@ -688,16 +707,25 @@ export default function App() {
       payload.id,
       `Updated program ${payload.aipRefCode}: ${payload.title}`
     );
+    const expectedUpdatedAt = db.programs.find((p) => p.id === payload.id)?.updatedAt;
     try {
-      const res = await dataService.updateProgram(payload, log);
+      const res = await dataService.updateProgram(payload, log, expectedUpdatedAt);
       const saved = res.program || payload;
       const recordedLog = res.auditLog || log;
+      const prevProg = db.programs.find((p) => p.id === saved.id);
+      const statusChanged =
+        (prevProg?.status || 'PENDING') !== (saved.status || 'PENDING');
       setDb((prev) => ({
         ...prev,
         programs: prev.programs.map((p) => (p.id === saved.id ? saved : p)),
         auditLogs: [recordedLog, ...prev.auditLogs],
       }));
-      notify('success', `Program "${saved.title}" updated.`);
+      notify(
+        'success',
+        statusChanged
+          ? `Program "${saved.title}" status updated to ${saved.status || 'PENDING'}.`
+          : `Program "${saved.title}" updated.`
+      );
     } catch (err) {
       notify('error', err instanceof Error ? err.message : 'Failed to update program.');
       throw err;
@@ -781,8 +809,9 @@ export default function App() {
       payload.id,
       `Updated PPA ${payload.referenceNumber}: ${payload.description}`
     );
+    const expectedUpdatedAt = db.activities.find((a) => a.id === payload.id)?.updatedAt;
     try {
-      const res = await dataService.updateActivity(payload, log);
+      const res = await dataService.updateActivity(payload, log, expectedUpdatedAt);
       const saved = res.activity || payload;
       const recordedLog = res.auditLog || log;
       setDb((prev) => ({
@@ -825,13 +854,20 @@ export default function App() {
   const handleUpdateStatus = async (
     activity: Activity,
     newStatus: ImplementationStatus,
-    remarks: string
+    remarks: string,
+    completionPct?: number
   ) => {
     if (!currentUser) return;
     const statusChanged = activity.status !== newStatus;
+    const normalizedCompletion =
+      completionPct !== undefined
+        ? Math.round(Math.min(100, Math.max(0, completionPct)) * 100) / 100
+        : activity.completionPct ?? 0;
+    const completionChanged = (activity.completionPct ?? 0) !== normalizedCompletion;
     const updated: Activity = {
       ...activity,
       status: newStatus,
+      completionPct: normalizedCompletion,
       remarks,
       updatedBy: currentUser.uid,
       updatedAt: new Date().toISOString(),
@@ -842,11 +878,15 @@ export default function App() {
       'Activity',
       activity.id,
       statusChanged
-        ? `Changed status of ${activity.referenceNumber} to ${newStatus}`
-        : `Updated remarks for ${activity.referenceNumber}`
+        ? `Changed status of ${activity.referenceNumber} to ${newStatus} (${normalizedCompletion}%)`
+        : completionChanged
+          ? `Updated completion of ${activity.referenceNumber} to ${normalizedCompletion}%`
+          : `Updated remarks for ${activity.referenceNumber}`
     );
+    const expectedUpdatedAt =
+      db.activities.find((a) => a.id === activity.id)?.updatedAt ?? activity.updatedAt;
     try {
-      const res = await dataService.updateActivity(updated, log);
+      const res = await dataService.updateActivity(updated, log, expectedUpdatedAt);
       const saved = res.activity || updated;
       const recordedLog = res.auditLog || log;
       setDb((prev) => ({
@@ -857,59 +897,13 @@ export default function App() {
       notify(
         'success',
         statusChanged
-          ? `Status updated to ${newStatus}.`
-          : `Remarks saved for ${activity.referenceNumber}.`
+          ? `Status updated to ${newStatus} (${normalizedCompletion}%).`
+          : completionChanged
+            ? `Completion updated to ${normalizedCompletion}% for ${activity.referenceNumber}.`
+            : `Remarks saved for ${activity.referenceNumber}.`
       );
     } catch (err) {
       notify('error', err instanceof Error ? err.message : 'Failed to update status.');
-      throw err;
-    }
-  };
-
-  const handleBulkUpdateActivityStatus = async (
-    ids: string[],
-    newStatus: ImplementationStatus
-  ) => {
-    if (!currentUser || ids.length === 0) return;
-    const targetIds = new Set(ids);
-    const targets = db.activities.filter((a) => targetIds.has(a.id));
-    if (targets.length === 0) return;
-
-    const now = new Date().toISOString();
-    const updatedMap = new Map<string, Activity>();
-    const newLogs: AuditLog[] = [];
-
-    try {
-      for (const act of targets) {
-        const updated: Activity = {
-          ...act,
-          status: newStatus,
-          updatedBy: currentUser.uid,
-          updatedAt: now,
-        };
-        const log = buildAuditLog(
-          currentUser,
-          'STATUS_CHANGE',
-          'Activity',
-          act.id,
-          `Bulk updated status of ${act.referenceNumber} to ${newStatus}`
-        );
-        const res = await dataService.updateActivity(updated, log);
-        updatedMap.set(updated.id, res.activity || updated);
-        newLogs.unshift(res.auditLog || log);
-      }
-
-      setDb((prev) => ({
-        ...prev,
-        activities: prev.activities.map((a) => updatedMap.get(a.id) ?? a),
-        auditLogs: [...newLogs, ...prev.auditLogs],
-      }));
-      notify(
-        'success',
-        `Updated status of ${updatedMap.size} ${updatedMap.size === 1 ? 'activity' : 'activities'} to ${newStatus}.`
-      );
-    } catch (err) {
-      notify('error', err instanceof Error ? err.message : 'Bulk status update failed.');
       throw err;
     }
   };
@@ -977,7 +971,9 @@ export default function App() {
         ...prev,
         activities: prev.activities.map((a) => {
           const nextIdx = orderMap.get(a.id);
-          return nextIdx !== undefined ? { ...a, orderIndex: nextIdx } : a;
+          return nextIdx !== undefined
+            ? { ...a, orderIndex: nextIdx, updatedAt: res.updatedAt || a.updatedAt }
+            : a;
         }),
         auditLogs: [recordedLog, ...prev.auditLogs],
       }));
@@ -1880,7 +1876,7 @@ export default function App() {
                                     {a.description}
                                   </p>
                                   <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                                    {a.officeName} · {a.status}
+                                    {a.officeName} · {scopedPrograms.find((p) => p.id === a.programId)?.status || a.status}
                                   </p>
                                 </button>
                               ))}
@@ -1945,7 +1941,10 @@ export default function App() {
 
               <button
                 type="button"
-                onClick={() => window.print()}
+                onClick={() => {
+                  setPrintTimestamp(formatPrintTimestamp());
+                  window.print();
+                }}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-[13px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
                 title={`Print ${activeNav.label}`}
                 aria-label={`Print ${activeNav.label}`}
@@ -2009,14 +2008,17 @@ export default function App() {
                     </h2>
                   </div>
                 </div>
-                <div className="text-right text-[10px] text-slate-600 font-mono">
+                <div className="text-right text-[10px] text-slate-600 font-mono space-y-0.5">
                   <p>
                     Fiscal Year:{' '}
                     {selectedFiscalYear === 'ALL' ? 'All Fiscal Years' : `FY ${selectedFiscalYear}`}
                   </p>
                   <p>
-                    Printed by: {currentUser.displayName} · {new Date().toLocaleDateString('en-PH')}
+                    Printed by:{' '}
+                    <span className="font-semibold text-slate-800">{currentUser.displayName}</span>
+                    {currentUser.role ? ` (${ROLE_LABELS[currentUser.role] || currentUser.role})` : ''}
                   </p>
+                  <p>Timestamp: {printTimestamp}</p>
                 </div>
               </div>
             </div>
@@ -2066,7 +2068,6 @@ export default function App() {
               onCreateActivity={handleCreateActivity}
               onUpdateActivity={handleUpdateActivity}
               onDeleteActivity={handleDeleteActivity}
-              onBulkUpdateActivityStatus={handleBulkUpdateActivityStatus}
               onBulkDeleteActivities={handleBulkDeleteActivities}
               onReorderActivities={handleReorderActivities}
             />
@@ -2107,6 +2108,7 @@ export default function App() {
               selectedFiscalYear={selectedFiscalYear}
               userRole={currentUser.role}
               userUid={currentUser.uid}
+              onUpdateProgram={handleUpdateProgram}
               onUpdateStatus={handleUpdateStatus}
             />
           )}

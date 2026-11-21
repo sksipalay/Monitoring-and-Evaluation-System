@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
-import { History, MinusCircle, PlusCircle, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { History, MinusCircle, Plus, PlusCircle, X } from 'lucide-react';
 import { ActivityComputed, Program, ProgramSupplementalLog } from '../../types/ppa';
 import { useModalFocusTrap } from '../../hooks/useModalFocusTrap';
 import {
-  calculateSignedRevisedDelta,
   formatPHP,
+  getProgramSupplementalBreakdown,
   isPersonnelServicesFund,
   round2,
   safeNum,
@@ -29,15 +29,23 @@ export function SupplementalBudgetModal({
   onSaveProgram,
 }: SupplementalBudgetModalProps) {
   const [actionType, setActionType] = useState<'ADD' | 'SUBTRACT'>('ADD');
+  const [supplementalNumber, setSupplementalNumber] = useState<number>(1);
+  const [maxSlotVisible, setMaxSlotVisible] = useState<number>(5);
   const [amountInput, setAmountInput] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const modalRef = useModalFocusTrap<HTMLDivElement>(Boolean(program), onClose);
 
+  const breakdown = useMemo(() => getProgramSupplementalBreakdown(program), [program]);
+
   useEffect(() => {
     if (program) {
+      const slotKeys = Object.keys(breakdown.byNumber).map((k) => Number(k) || 1);
+      const highestExisting = Math.max(5, ...slotKeys);
       setActionType('ADD');
+      setSupplementalNumber(1);
+      setMaxSlotVisible(highestExisting);
       setAmountInput('');
       setNotes('');
       setError(null);
@@ -51,20 +59,54 @@ export function SupplementalBudgetModal({
   const currentSupp = round2(safeNum(program.supplementalBudget));
   const currentApproved = summary.approvedBudget;
   const currentRevised = summary.revisedBudget;
-  const isPsExempt = isPersonnelServicesFund(program.sourceOfFund);
+  const isPsExempt =
+    isPersonnelServicesFund(program.sourceOfFund) ||
+    (currentApproved > 0 && currentRevised === currentApproved);
 
   const rawAmount = round2(Math.max(0, safeNum(amountInput)));
   const signedDelta = actionType === 'ADD' ? rawAmount : -rawAmount;
   const nextSupp = round2(currentSupp + signedDelta);
-  const projectedApproved = round2(currentApproved + signedDelta);
   const exceedsAvailable = actionType === 'SUBTRACT' && rawAmount > currentApproved;
 
-  const projectedRevised = Math.max(
-    0,
-    round2(currentRevised + calculateSignedRevisedDelta(signedDelta, program.sourceOfFund))
-  );
+  const currentSlotAmount = round2(breakdown.byNumber[supplementalNumber] || 0);
+  const projectedSlotAmount = round2(currentSlotAmount + signedDelta);
+
+  const projectedEntry: ProgramSupplementalLog | null =
+    rawAmount > 0
+      ? {
+          id: 'preview',
+          type: actionType,
+          supplementalNumber,
+          amount: rawAmount,
+          signedAmount: signedDelta,
+          notes: notes.trim() || undefined,
+          updatedBy: userUid,
+          updatedByName: userName,
+          timestamp: new Date().toISOString(),
+        }
+      : null;
 
   const history = program.supplementalLogs || [];
+  const projectedSummary = summarizeProgram(
+    {
+      ...program,
+      supplementalBudget: nextSupp,
+      supplementalLogs: projectedEntry ? [projectedEntry, ...history] : history,
+    },
+    programActivities
+  );
+
+  const projectedApproved = projectedSummary.approvedBudget;
+  const projectedRevised = projectedSummary.revisedBudget;
+
+  const slotOptions = Array.from({ length: maxSlotVisible }, (_, idx) => idx + 1);
+
+  const handleAddNextSlot = () => {
+    const nextSlot = Math.min(50, maxSlotVisible + 1);
+    setMaxSlotVisible(nextSlot);
+    setSupplementalNumber(nextSlot);
+    setError(null);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -88,6 +130,7 @@ export function SupplementalBudgetModal({
       const entry: ProgramSupplementalLog = {
         id: `supp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         type: actionType,
+        supplementalNumber,
         amount: rawAmount,
         signedAmount: signedDelta,
         notes: notes.trim() || undefined,
@@ -171,7 +214,7 @@ export function SupplementalBudgetModal({
           </div>
           <div>
             <p className="text-slate-500 dark:text-slate-400">
-              {isPsExempt ? 'Revised (PS Exempt)' : 'Revised (-15%)'}
+              {isPsExempt ? 'Revised Total (PS Exempt)' : 'Revised Total (-15%)'}
             </p>
             <p className="mt-1 font-mono font-bold text-[#163A5F] dark:text-sky-400 tabular-nums">
               {formatPHP(currentRevised)}
@@ -229,13 +272,108 @@ export function SupplementalBudgetModal({
             </div>
           </div>
 
+          {/* Supplemental Budget Number Selector (1, 2, 3, 4, 5, ...) */}
+          <div>
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+              <label
+                htmlFor="supplemental-slot-select"
+                className="block text-xs font-semibold text-slate-700 dark:text-slate-300"
+              >
+                {actionType === 'ADD'
+                  ? 'Select Supplemental Budget to Add To *'
+                  : 'Select Supplemental Budget to Subtract From *'}
+              </label>
+              {maxSlotVisible < 50 && (
+                <button
+                  type="button"
+                  onClick={handleAddNextSlot}
+                  className="inline-flex items-center gap-1 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-[11px] font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                >
+                  <Plus className="h-3 w-3" aria-hidden="true" />
+                  <span>Add Supplemental {maxSlotVisible + 1}</span>
+                </button>
+              )}
+            </div>
+
+            <div
+              className="grid grid-cols-2 sm:grid-cols-3 gap-2"
+              role="radiogroup"
+              aria-label="Supplemental budget slot"
+            >
+              {slotOptions.map((slotNum) => {
+                const slotBalance = round2(breakdown.byNumber[slotNum] || 0);
+                const isSelected = supplementalNumber === slotNum;
+                return (
+                  <button
+                    key={slotNum}
+                    type="button"
+                    role="radio"
+                    aria-checked={isSelected}
+                    onClick={() => {
+                      setSupplementalNumber(slotNum);
+                      setError(null);
+                    }}
+                    className={`rounded-lg border px-3 py-2 text-left transition-all ${
+                      isSelected
+                        ? actionType === 'ADD'
+                          ? 'border-emerald-600 bg-emerald-50/90 text-emerald-900 dark:border-emerald-500 dark:bg-emerald-950/50 dark:text-emerald-200 ring-1 ring-emerald-500/30'
+                          : 'border-red-600 bg-red-50/90 text-red-900 dark:border-red-500 dark:bg-red-950/50 dark:text-red-200 ring-1 ring-red-500/30'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/80 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    <p className="text-xs font-semibold truncate">
+                      Supplemental Budget {slotNum}
+                    </p>
+                    <p
+                      className={`mt-0.5 font-mono text-[11px] font-medium tabular-nums ${
+                        slotBalance > 0
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : slotBalance < 0
+                            ? 'text-red-600 dark:text-red-400'
+                            : 'text-slate-500 dark:text-slate-400'
+                      }`}
+                    >
+                      {slotBalance > 0 ? `+${formatPHP(slotBalance)}` : formatPHP(slotBalance)}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+
+            <select
+              id="supplemental-slot-select"
+              value={supplementalNumber}
+              onChange={(e) => {
+                const next = Math.max(1, Math.min(50, Number(e.target.value) || 1));
+                setSupplementalNumber(next);
+                if (next > maxSlotVisible) setMaxSlotVisible(next);
+                setError(null);
+              }}
+              aria-label="Supplemental Budget choice"
+              className="mt-2 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-medium text-slate-800 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+            >
+              {slotOptions.map((slotNum) => {
+                const slotBalance = round2(breakdown.byNumber[slotNum] || 0);
+                const formatted =
+                  slotBalance > 0 ? `+${formatPHP(slotBalance)}` : formatPHP(slotBalance);
+                return (
+                  <option key={slotNum} value={slotNum}>
+                    Supplemental Budget {slotNum} (Current: {formatted})
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label
                 htmlFor="supplemental-amount-input"
                 className="block text-xs font-semibold text-slate-700 dark:text-slate-300"
               >
-                {actionType === 'ADD' ? 'Amount to Add (₱) *' : 'Amount to Subtract (₱) *'}
+                {actionType === 'ADD'
+                  ? `Amount to Add to Supplemental Budget ${supplementalNumber} (₱) *`
+                  : `Amount to Subtract from Supplemental Budget ${supplementalNumber} (₱) *`}
               </label>
               <input
                 id="supplemental-amount-input"
@@ -266,7 +404,7 @@ export function SupplementalBudgetModal({
                 maxLength={200}
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
-                placeholder="e.g., Supplemental Budget No. 1 / Realignment"
+                placeholder={`e.g., Supplemental Budget No. ${supplementalNumber} Ordinance`}
                 className="mt-1.5 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3.5 py-2.5 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
               />
             </div>
@@ -281,7 +419,9 @@ export function SupplementalBudgetModal({
           {/* Live Projected Result */}
           <div className="rounded-xl border border-blue-200 dark:border-sky-800/70 bg-blue-50/70 dark:bg-sky-950/30 p-4 space-y-2 text-xs">
             <div className="flex items-center justify-between font-semibold text-slate-700 dark:text-slate-300">
-              <span>Projected Impact After Saving</span>
+              <span>
+                Projected Impact After Saving (Supplemental Budget {supplementalNumber})
+              </span>
               <span
                 className={`font-mono font-bold tabular-nums ${
                   actionType === 'ADD'
@@ -292,7 +432,17 @@ export function SupplementalBudgetModal({
                 {actionType === 'ADD' ? `+${formatPHP(rawAmount)}` : `−${formatPHP(rawAmount)}`}
               </span>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-blue-200/70 dark:border-sky-800/60">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-blue-200/70 dark:border-sky-800/60">
+              <div>
+                <p className="text-slate-500 dark:text-slate-400">
+                  Supplemental Budget {supplementalNumber}
+                </p>
+                <p className="mt-0.5 font-mono font-bold text-slate-900 dark:text-slate-100 tabular-nums">
+                  {projectedSlotAmount > 0
+                    ? `+${formatPHP(projectedSlotAmount)}`
+                    : formatPHP(projectedSlotAmount)}
+                </p>
+              </div>
               <div>
                 <p className="text-slate-500 dark:text-slate-400">New Net Supplemental</p>
                 <p className="mt-0.5 font-mono font-bold text-slate-900 dark:text-slate-100 tabular-nums">
@@ -313,7 +463,7 @@ export function SupplementalBudgetModal({
               </div>
               <div>
                 <p className="text-slate-500 dark:text-slate-400">
-                  New Revised Budget ({isPsExempt ? 'PS Exempt' : '−15%'})
+                  Revised Total Budget ({isPsExempt ? 'PS Exempt' : '−15%'})
                 </p>
                 <p className="mt-0.5 font-mono font-bold text-[#163A5F] dark:text-sky-400 tabular-nums">
                   {formatPHP(projectedRevised)}
@@ -348,8 +498,8 @@ export function SupplementalBudgetModal({
                 {saving
                   ? 'Applying...'
                   : actionType === 'ADD'
-                    ? 'Add Supplemental Budget'
-                    : 'Subtract Budget'}
+                    ? `Add to Supplemental Budget ${supplementalNumber}`
+                    : `Subtract from Supplemental Budget ${supplementalNumber}`}
               </span>
             </button>
           </div>
@@ -363,30 +513,39 @@ export function SupplementalBudgetModal({
               <span>Supplemental Adjustment History ({history.length})</span>
             </div>
             <div className="max-h-40 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800 rounded-lg border border-slate-200 dark:border-slate-800 text-xs">
-              {history.map((item) => (
-                <div
-                  key={item.id}
-                  className="px-3 py-2 flex flex-wrap items-center justify-between gap-2 bg-white dark:bg-slate-900"
-                >
-                  <div className="min-w-0">
-                    <span
-                      className={`font-mono font-bold mr-2 ${
-                        item.type === 'ADD'
-                          ? 'text-emerald-600 dark:text-emerald-400'
-                          : 'text-red-600 dark:text-red-400'
-                      }`}
-                    >
-                      {item.type === 'ADD' ? `+${formatPHP(item.amount)}` : `−${formatPHP(item.amount)}`}
-                    </span>
-                    <span className="text-slate-700 dark:text-slate-300">
-                      {item.notes || (item.type === 'ADD' ? 'Budget Added' : 'Budget Subtracted')}
-                    </span>
+              {history.map((item) => {
+                const slotNum = item.supplementalNumber || 1;
+                return (
+                  <div
+                    key={item.id}
+                    className="px-3 py-2 flex flex-wrap items-center justify-between gap-2 bg-white dark:bg-slate-900"
+                  >
+                    <div className="min-w-0 flex flex-wrap items-center gap-2">
+                      <span
+                        className={`font-mono font-bold ${
+                          item.type === 'ADD'
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-red-600 dark:text-red-400'
+                        }`}
+                      >
+                        {item.type === 'ADD'
+                          ? `+${formatPHP(item.amount)}`
+                          : `−${formatPHP(item.amount)}`}
+                      </span>
+                      <span className="rounded bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-700 dark:text-slate-300">
+                        Supplemental Budget {slotNum}
+                      </span>
+                      <span className="text-slate-700 dark:text-slate-300">
+                        {item.notes ||
+                          (item.type === 'ADD' ? 'Budget Added' : 'Budget Subtracted')}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                      {item.updatedByName} · {new Date(item.timestamp).toLocaleDateString('en-PH')}
+                    </div>
                   </div>
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-                    {item.updatedByName} · {new Date(item.timestamp).toLocaleDateString('en-PH')}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

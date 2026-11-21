@@ -43,6 +43,7 @@ import {
 import { dataService } from '../../services/dataService';
 import { useModalFocusTrap } from '../../hooks/useModalFocusTrap';
 import { AuditLogTimeline } from '../ui/AuditLogTimeline';
+import { StatusBadge } from '../ui/StatusBadge';
 import {
   Activity,
   ActivityComputed,
@@ -221,7 +222,6 @@ export function DashboardModule({
   const [qaMode, setQaMode] = useState<'add' | 'set'>('add');
   const [qaPhysical, setQaPhysical] = useState<string>('0');
   const [qaExpenditure, setQaExpenditure] = useState<string>('0');
-  const [qaStatus, setQaStatus] = useState<ImplementationStatus | 'KEEP'>('KEEP');
   const [qaNote, setQaNote] = useState<string>('');
   const [qaDate, setQaDate] = useState<string>(new Date().toISOString().slice(0, 10));
   const [qaSaving, setQaSaving] = useState(false);
@@ -284,6 +284,11 @@ export function DashboardModule({
     [activities, selectedFiscalYear]
   );
 
+  const fyProgramLookup = useMemo(
+    () => new Map(fyPrograms.map((p) => [p.id, p])),
+    [fyPrograms]
+  );
+
   const filteredActivities = useMemo(() => {
     return fyActivities.filter((a) => {
       if (officeFilter !== 'ALL' && a.officeId !== officeFilter && a.officeName !== officeFilter)
@@ -291,20 +296,34 @@ export function DashboardModule({
       if (programFilter !== 'ALL' && a.programId !== programFilter && a.subprogramId !== programFilter)
         return false;
       if (activityFilter !== 'ALL' && a.id !== activityFilter) return false;
-      if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
+      if (statusFilter !== 'ALL') {
+        const progStatus = fyProgramLookup.get(a.programId)?.status || a.status || 'PENDING';
+        if (progStatus !== statusFilter) return false;
+      }
       return true;
     });
-  }, [fyActivities, officeFilter, programFilter, activityFilter, statusFilter]);
+  }, [fyActivities, fyProgramLookup, officeFilter, programFilter, activityFilter, statusFilter]);
 
   const filteredPrograms = useMemo(() => {
     if (programFilter !== 'ALL') {
-      return fyPrograms.filter((p) => p.id === programFilter);
+      return fyPrograms.filter((p) => {
+        if (p.id !== programFilter) return false;
+        if (statusFilter !== 'ALL' && (p.status || 'PENDING') !== statusFilter) return false;
+        return true;
+      });
     }
     if (officeFilter === 'ALL' && activityFilter === 'ALL' && statusFilter === 'ALL') {
       return fyPrograms;
     }
+    if (officeFilter === 'ALL' && activityFilter === 'ALL' && statusFilter !== 'ALL') {
+      return fyPrograms.filter((p) => (p.status || 'PENDING') === statusFilter);
+    }
     const activeProgramIds = new Set(filteredActivities.map((a) => a.programId));
-    return fyPrograms.filter((p) => activeProgramIds.has(p.id));
+    return fyPrograms.filter(
+      (p) =>
+        activeProgramIds.has(p.id) &&
+        (statusFilter === 'ALL' || (p.status || 'PENDING') === statusFilter)
+    );
   }, [fyPrograms, filteredActivities, officeFilter, programFilter, activityFilter, statusFilter]);
 
   const summary = useMemo(
@@ -313,13 +332,9 @@ export function DashboardModule({
   );
 
   const executiveSummary = useMemo(() => {
-    const actsByProgram = new Map<string, ActivityComputed[]>();
     const activeOfficeKeys = new Set<string>();
 
     for (const a of filteredActivities) {
-      const list = actsByProgram.get(a.programId);
-      if (list) list.push(a);
-      else actsByProgram.set(a.programId, [a]);
       if (a.officeId || a.officeName) {
         activeOfficeKeys.add(a.officeId || a.officeName);
       }
@@ -330,17 +345,14 @@ export function DashboardModule({
       if (p.officeId || p.officeName) {
         activeOfficeKeys.add(p.officeId || p.officeName);
       }
-      const pActs = actsByProgram.get(p.id) || [];
-      const hasLiveActivity =
-        pActs.length === 0 || pActs.some((a) => a.status !== 'NOT IMPLEMENTED');
-      if (hasLiveActivity) {
+      if ((p.status || 'PENDING') !== 'NOT IMPLEMENTED') {
         totalActivePrograms++;
       }
     }
 
     const completionRatePct =
-      summary.totalActivities > 0
-        ? round2((summary.completedCount / summary.totalActivities) * 100)
+      summary.totalPrograms > 0
+        ? round2((summary.completedCount / summary.totalPrograms) * 100)
         : 0;
 
     const remainingBudgetPct =
@@ -437,7 +449,7 @@ export function DashboardModule({
   }, [summary, quarterChartMode]);
 
   const statusDistData = useMemo(() => {
-    const total = summary.totalActivities;
+    const total = summary.totalPrograms;
     return [
       {
         name: 'COMPLETED' as ImplementationStatus,
@@ -632,7 +644,6 @@ export function DashboardModule({
     setQaMode('add');
     setQaPhysical('0');
     setQaExpenditure('0');
-    setQaStatus('KEEP');
     setQaNote('');
     setQaDate(new Date().toISOString().slice(0, 10));
     setQaSavedBanner(null);
@@ -665,7 +676,8 @@ export function DashboardModule({
         },
       };
 
-      const nextStatus = qaStatus === 'KEEP' ? matchedQuickActivity.status : qaStatus;
+      const parentProg = programs.find((p) => p.id === matchedQuickActivity.programId);
+      const nextStatus = parentProg?.status || matchedQuickActivity.status;
       const trimmedNote = qaNote.trim();
 
       await onUpdateActivity({
@@ -697,7 +709,6 @@ export function DashboardModule({
         setQaPhysical('0');
         setQaExpenditure('0');
         setQaNote('');
-        setQaStatus('KEEP');
         setQaSavedBanner(`Saved accomplishment update for ${matchedQuickActivity.referenceNumber}.`);
       } else {
         setQuickAddOpen(false);
@@ -1055,7 +1066,7 @@ export function DashboardModule({
           </div>
 
           <div className="min-w-[150px] flex-1">
-            <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">Implementation Status</label>
+            <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">Program Status</label>
             <select
               value={statusFilter}
               onChange={(e) => setStatusFilter(e.target.value)}
@@ -1165,7 +1176,7 @@ export function DashboardModule({
               <span className="font-mono font-semibold text-slate-700 dark:text-slate-200 tabular-nums">
                 {summary.totalActivities}
               </span>{' '}
-              filtered PPA{summary.totalActivities === 1 ? '' : 's'} ({summary.ongoingCount} on-going,{' '}
+              filtered PPA{summary.totalActivities === 1 ? '' : 's'} ({summary.ongoingCount} programs on-going,{' '}
               {summary.pendingCount} pending)
             </p>
           </div>
@@ -1174,7 +1185,7 @@ export function DashboardModule({
           <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-950/60 p-4">
             <div className="flex items-start justify-between gap-2">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                Completion Rate Percentage
+                Program Completion Rate
               </p>
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-600/10 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">
                 <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
@@ -1192,7 +1203,7 @@ export function DashboardModule({
               />
             </div>
             <p className="mt-2 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-              {summary.completedCount} of {summary.totalActivities} PPAs completed · Physical{' '}
+              {summary.completedCount} of {summary.totalPrograms} programs completed · Physical{' '}
               {formatPct(summary.overallPhysicalPct)}
             </p>
           </div>
@@ -1251,7 +1262,7 @@ export function DashboardModule({
         </div>
       </section>
 
-      {/* Visual Progress Overview: Total PPA Count vs Completion Status Donut Chart */}
+      {/* Visual Progress Overview: Total Program Count vs Accomplishment Status Donut Chart */}
       <section
         aria-label="Visual Progress Overview"
         className="print-avoid-break rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
@@ -1262,19 +1273,19 @@ export function DashboardModule({
               Visual Progress Overview
             </p>
             <h2 className="text-base sm:text-[17px] font-semibold text-slate-900 dark:text-slate-100">
-              Total PPA Count vs. Completion Status
+              Program Accomplishment Status Overview
             </h2>
           </div>
           <span className="font-mono text-xs font-semibold text-slate-600 dark:text-slate-300 tabular-nums">
-            {summary.completedCount} / {summary.totalActivities} Completed (
+            {summary.completedCount} / {summary.totalPrograms} Completed (
             {formatPct(executiveSummary.completionRatePct)})
           </span>
         </div>
 
-        {summary.totalActivities === 0 ? (
+        {summary.totalPrograms === 0 ? (
           <div className="flex h-56 items-center justify-center text-center">
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              No PPA records match the active fiscal year or office filter.
+              No program records match the active fiscal year or office filter.
             </p>
           </div>
         ) : (
@@ -1304,20 +1315,20 @@ export function DashboardModule({
                     formatter={(value, name) => {
                       const count = Number(value) || 0;
                       const pct =
-                        summary.totalActivities > 0
-                          ? (count / summary.totalActivities) * 100
+                        summary.totalPrograms > 0
+                          ? (count / summary.totalPrograms) * 100
                           : 0;
-                      return [`${count} PPA${count === 1 ? '' : 's'} (${formatPct(pct)})`, String(name)];
+                      return [`${count} Program${count === 1 ? '' : 's'} (${formatPct(pct)})`, String(name)];
                     }}
                   />
                 </PieChart>
               </ResponsiveContainer>
               <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center text-center">
                 <span className="font-mono text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-100 tabular-nums">
-                  {summary.totalActivities}
+                  {summary.totalPrograms}
                 </span>
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                  Total PPAs
+                  Total Programs
                 </span>
               </div>
             </div>
@@ -1347,7 +1358,7 @@ export function DashboardModule({
                       {st.value}
                     </span>
                     <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                      of {summary.totalActivities} PPAs
+                      of {summary.totalPrograms} Programs
                     </span>
                   </div>
                   <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-200/80 dark:bg-slate-800">
@@ -2195,26 +2206,24 @@ export function DashboardModule({
                 </div>
               )}
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  Implementation Status (Optional)
-                </label>
-                <select
-                  value={qaStatus}
-                  onChange={(e) =>
-                    setQaStatus(e.target.value as ImplementationStatus | 'KEEP')
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-800/40 px-3.5 py-2.5">
+                <div>
+                  <span className="block text-xs font-semibold text-slate-700 dark:text-slate-300">
+                    Program Accomplishment Status
+                  </span>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Managed at the Program level under Accomplishment Status
+                  </span>
+                </div>
+                <StatusBadge
+                  status={
+                    programs.find((p) => p.id === (matchedQuickActivity || selectedQuickActivity).programId)
+                      ?.status ||
+                    (matchedQuickActivity || selectedQuickActivity).status ||
+                    'PENDING'
                   }
-                  className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
-                >
-                  <option value="KEEP">
-                    Keep Current ({(matchedQuickActivity || selectedQuickActivity).status})
-                  </option>
-                  {STATUS_OPTIONS.map((s) => (
-                    <option key={s} value={s}>
-                      {s}
-                    </option>
-                  ))}
-                </select>
+                  compact
+                />
               </div>
 
               <div>

@@ -9,10 +9,14 @@ import {
   Circle,
   Clock,
   Edit3,
+  ExternalLink,
   Eye,
+  FileText,
   FolderPlus,
   GripVertical,
   History,
+  Link2,
+  Paperclip,
   Plus,
   PlusCircle,
   Search,
@@ -22,6 +26,7 @@ import {
 import {
   Activity,
   ActivityComputed,
+  ActivityEvidenceItem,
   ActivityMilestone,
   AuditLog,
   BudgetClassification,
@@ -43,6 +48,7 @@ import {
   formatPHP,
   formatPct,
   formatQty,
+  getProgramSupplementalBreakdown,
   isPersonnelServicesFund,
   normalizeMonthlyPhysicalTargets,
   resolveActivityBudgetDisplay,
@@ -84,7 +90,6 @@ interface ProgramsActivitiesModuleProps {
   onCreateActivity: (activity: Activity) => Promise<void>;
   onUpdateActivity: (activity: Activity) => Promise<void>;
   onDeleteActivity: (id: string) => Promise<void>;
-  onBulkUpdateActivityStatus?: (ids: string[], newStatus: ImplementationStatus) => Promise<void>;
   onBulkDeleteActivities?: (ids: string[]) => Promise<void>;
   onReorderActivities?: (updates: { id: string; orderIndex: number }[]) => Promise<void>;
 }
@@ -138,6 +143,17 @@ function buildMonthlyPhysicalActualMap(act?: ActivityComputed | null): Record<Mo
   return map;
 }
 
+function isSafeExternalUrl(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 export function ProgramsActivitiesModule({
   programs,
   activities,
@@ -157,20 +173,19 @@ export function ProgramsActivitiesModule({
   onCreateActivity,
   onUpdateActivity,
   onDeleteActivity,
-  onBulkUpdateActivityStatus,
   onBulkDeleteActivities,
   onReorderActivities,
 }: ProgramsActivitiesModuleProps) {
   const isOfficeScoped = isOfficeScopedRole(userRole) && Boolean(userOfficeId);
   const canEditStructure = canEditPpaStructure(userRole);
   const canEditStatusRemarks = canEditStatusOrRemarks(userRole);
-  const canBulkSelect = canEditStatusRemarks || canEditStructure;
+  const canBulkSelect = canEditStructure && Boolean(onBulkDeleteActivities);
 
   const [search, setSearch] = useState('');
   const [officeFilter, setOfficeFilter] = useState('ALL');
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [sortField, setSortField] = useState<
-    'ref' | 'approved' | 'revised' | 'expenditure' | 'status' | null
+    'ref' | 'approved' | 'revised' | 'expenditure' | null
   >(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   const [collapsedPrograms, setCollapsedPrograms] = useState<Record<string, boolean>>({});
@@ -179,7 +194,6 @@ export function ProgramsActivitiesModule({
 
   // Bulk selection state
   const [selectedActivityIds, setSelectedActivityIds] = useState<string[]>([]);
-  const [bulkStatus, setBulkStatus] = useState<ImplementationStatus>('COMPLETED');
   const [bulkBusy, setBulkBusy] = useState(false);
 
   // Drag-and-drop PPA reordering state
@@ -206,10 +220,12 @@ export function ProgramsActivitiesModule({
   const [editingProgram, setEditingProgram] = useState<Program | null>(null);
   const [progForm, setProgForm] = useState({
     title: '',
+    targetOutputs: '',
     budget: 0,
     monthlyPhysicalTarget: createEmptyMonthlyPhysicalTargets(),
     sourceOfFund: SOURCE_OF_FUND_OPTIONS[3],
     gadFund: false,
+    status: 'PENDING' as ImplementationStatus,
     officeId: isOfficeScoped ? userOfficeId : offices[0]?.id || '',
     parentProgramId: '',
   });
@@ -233,9 +249,6 @@ export function ProgramsActivitiesModule({
     month: currentMonthKey,
     expenditure: 0,
     physicalActual: 0,
-    startDate: '',
-    endDate: '',
-    status: 'PENDING' as ImplementationStatus,
     remarks: '',
   });
 
@@ -244,6 +257,18 @@ export function ProgramsActivitiesModule({
   const [newMilestoneDueDate, setNewMilestoneDueDate] = useState('');
   const [milestoneBusy, setMilestoneBusy] = useState(false);
   const [milestoneError, setMilestoneError] = useState<string | null>(null);
+  const [newEvidenceTitle, setNewEvidenceTitle] = useState('');
+  const [newEvidenceNote, setNewEvidenceNote] = useState('');
+  const [newEvidenceUrl, setNewEvidenceUrl] = useState('');
+  const [evidenceBusy, setEvidenceBusy] = useState(false);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
+
+  const [actEvidenceDraft, setActEvidenceDraft] = useState<ActivityEvidenceItem[]>([]);
+  const [formEvTitle, setFormEvTitle] = useState('');
+  const [formEvNote, setFormEvNote] = useState('');
+  const [formEvUrl, setFormEvUrl] = useState('');
+  const [formEvError, setFormEvError] = useState<string | null>(null);
+
   const [supplementalProgram, setSupplementalProgram] = useState<Program | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{
     type: 'program' | 'activity' | 'bulk_activity';
@@ -257,6 +282,10 @@ export function ProgramsActivitiesModule({
     setNewMilestoneTitle('');
     setNewMilestoneDueDate('');
     setMilestoneError(null);
+    setNewEvidenceTitle('');
+    setNewEvidenceNote('');
+    setNewEvidenceUrl('');
+    setEvidenceError(null);
   }, [detailActivity?.id]);
 
   const programModalRef = useModalFocusTrap<HTMLDivElement>(
@@ -298,7 +327,6 @@ export function ProgramsActivitiesModule({
     const list = activities.filter((a) => {
       if (selectedFiscalYear !== 'ALL' && a.fiscalYear !== selectedFiscalYear) return false;
       if (officeFilter !== 'ALL' && a.officeId !== officeFilter) return false;
-      if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
       if (q) {
         const hay = `${a.referenceNumber} ${a.description} ${a.targetOutputs} ${a.officeName}`.toLowerCase();
         if (!hay.includes(q)) return false;
@@ -322,10 +350,9 @@ export function ProgramsActivitiesModule({
       if (sortField === 'revised') return (a.revisedBudget - b.revisedBudget) * dir;
       if (sortField === 'expenditure')
         return (a.annualFinancialActual - b.annualFinancialActual) * dir;
-      if (sortField === 'status') return a.status.localeCompare(b.status) * dir;
       return 0;
     });
-  }, [activities, selectedFiscalYear, officeFilter, statusFilter, search, sortField, sortDir]);
+  }, [activities, selectedFiscalYear, officeFilter, search, sortField, sortDir]);
 
   // Keep selected IDs synced to currently visible filtered activities
   const visibleSelectedIds = useMemo(() => {
@@ -335,7 +362,7 @@ export function ProgramsActivitiesModule({
 
   const selectedSet = useMemo(() => new Set(visibleSelectedIds), [visibleSelectedIds]);
 
-  const toggleSort = (field: 'ref' | 'approved' | 'revised' | 'expenditure' | 'status') => {
+  const toggleSort = (field: 'ref' | 'approved' | 'revised' | 'expenditure') => {
     if (sortField === field) {
       if (sortDir === 'asc') setSortDir('desc');
       else setSortField(null);
@@ -363,19 +390,6 @@ export function ProgramsActivitiesModule({
       for (const id of ids) next.add(id);
       return Array.from(next);
     });
-  };
-
-  const handleApplyBulkStatus = async () => {
-    if (!onBulkUpdateActivityStatus || visibleSelectedIds.length === 0) return;
-    setBulkBusy(true);
-    try {
-      await onBulkUpdateActivityStatus(visibleSelectedIds, bulkStatus);
-      setSelectedActivityIds([]);
-    } catch {
-      /* Error notification handled in parent handler */
-    } finally {
-      setBulkBusy(false);
-    }
   };
 
   const getActivityScopeKey = (act: ActivityComputed) =>
@@ -483,11 +497,14 @@ export function ProgramsActivitiesModule({
     if (!q && officeFilter === 'ALL' && statusFilter === 'ALL') return topPrograms;
     const matchedProgIds = new Set(filteredActivities.map((a) => a.programId));
     return topPrograms.filter((p) => {
-      if (matchedProgIds.has(p.id)) return true;
-      if (officeFilter !== 'ALL' && p.officeId !== officeFilter) return false;
-      if (statusFilter !== 'ALL') return false;
-      if (q) {
-        return `${p.aipRefCode} ${p.title} ${p.officeName}`.toLowerCase().includes(q);
+      const progStatus = p.status || 'PENDING';
+      if (statusFilter !== 'ALL' && progStatus !== statusFilter) return false;
+      if (q || officeFilter !== 'ALL') {
+        if (matchedProgIds.has(p.id)) return true;
+        if (officeFilter !== 'ALL' && p.officeId !== officeFilter) return false;
+        if (q) {
+          return `${p.aipRefCode} ${p.title} ${p.targetOutputs || ''} ${p.officeName}`.toLowerCase().includes(q);
+        }
       }
       return true;
     });
@@ -582,10 +599,12 @@ export function ProgramsActivitiesModule({
     setEditingProgram(null);
     setProgForm({
       title: '',
+      targetOutputs: '',
       budget: 0,
       monthlyPhysicalTarget: createEmptyMonthlyPhysicalTargets(),
       sourceOfFund: SOURCE_OF_FUND_OPTIONS[3],
       gadFund: false,
+      status: 'PENDING',
       officeId: isOfficeScoped ? userOfficeId : offices[0]?.id || '',
       parentProgramId: '',
     });
@@ -596,10 +615,12 @@ export function ProgramsActivitiesModule({
     setEditingProgram(prog);
     setProgForm({
       title: prog.title,
+      targetOutputs: prog.targetOutputs || '',
       budget: prog.budget ?? 0,
       monthlyPhysicalTarget: normalizeMonthlyPhysicalTargets(prog.monthlyPhysicalTarget),
       sourceOfFund: prog.sourceOfFund || SOURCE_OF_FUND_OPTIONS[3],
       gadFund: Boolean(prog.gadFund),
+      status: prog.status || 'PENDING',
       officeId: isOfficeScoped ? userOfficeId : prog.officeId,
       parentProgramId: prog.parentProgramId || '',
     });
@@ -624,16 +645,19 @@ export function ProgramsActivitiesModule({
           ? monthlyTargetSum
           : Math.max(0, safeNum(editingProgram?.physicalTarget));
       const fundSource = progForm.sourceOfFund.trim();
+      const targetOutputsValue = progForm.targetOutputs.trim();
 
       if (editingProgram) {
         await onUpdateProgram({
           ...editingProgram,
           title: progForm.title.trim(),
+          targetOutputs: targetOutputsValue,
           budget: budgetAmount,
           physicalTarget: physicalTargetValue,
           monthlyPhysicalTarget,
           sourceOfFund: fundSource,
           gadFund: progForm.gadFund,
+          status: progForm.status,
           officeId: office?.id || targetOfficeId,
           officeName: office?.name || userOfficeName || editingProgram.officeName,
           parentProgramId: progForm.parentProgramId || null,
@@ -655,12 +679,14 @@ export function ProgramsActivitiesModule({
           id: `prog-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           aipRefCode: autoRefCode,
           title: progForm.title.trim(),
+          targetOutputs: targetOutputsValue,
           sector: parentProg?.sector || 'General Public Services',
           budget: budgetAmount,
           physicalTarget: physicalTargetValue,
           monthlyPhysicalTarget,
           sourceOfFund: fundSource,
           gadFund: progForm.gadFund,
+          status: progForm.status,
           fiscalYear: activeFy,
           officeId: office?.id || targetOfficeId || '',
           officeName: office?.name || userOfficeName || 'MPDO',
@@ -681,10 +707,7 @@ export function ProgramsActivitiesModule({
   const openNewActivity = (programId?: string, subprogramId?: string) => {
     const defaultProg = programId || topPrograms[0]?.id || '';
     const prog = programs.find((p) => p.id === defaultProg);
-    const defaultSource =
-      prog?.sourceOfFund && SOURCE_OF_FUND_OPTIONS.includes(prog.sourceOfFund)
-        ? prog.sourceOfFund
-        : SOURCE_OF_FUND_OPTIONS[1];
+    const defaultSource = prog?.sourceOfFund?.trim() || SOURCE_OF_FUND_OPTIONS[3];
     setEditingActivity(null);
     setMonthlyExpenditures(buildMonthlyExpenditureMap(null));
     setMonthlyPhysicalActuals(buildMonthlyPhysicalActualMap(null));
@@ -698,11 +721,13 @@ export function ProgramsActivitiesModule({
       month: currentMonthKey,
       expenditure: 0,
       physicalActual: 0,
-      startDate: '',
-      endDate: '',
-      status: 'PENDING',
       remarks: '',
     });
+    setActEvidenceDraft([]);
+    setFormEvTitle('');
+    setFormEvNote('');
+    setFormEvUrl('');
+    setFormEvError(null);
     setActivityModalOpen(true);
   };
 
@@ -732,17 +757,19 @@ export function ProgramsActivitiesModule({
       month: firstActiveMonth,
       expenditure: expMap[firstActiveMonth] ?? 0,
       physicalActual: physMap[firstActiveMonth] ?? 0,
-      startDate: act.startDate || '',
-      endDate: act.endDate || '',
-      status: act.status,
       remarks: act.remarks,
     });
+    setActEvidenceDraft(Array.isArray(act.evidence) ? [...act.evidence] : []);
+    setFormEvTitle('');
+    setFormEvNote('');
+    setFormEvUrl('');
+    setFormEvError(null);
     setActivityModalOpen(true);
   };
 
   const handleSaveActivity = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!actForm.description.trim() || !actForm.programId) return;
+    if (!actForm.programId) return;
     setSaving(true);
     try {
       const targetOfficeId = isOfficeScoped
@@ -750,14 +777,11 @@ export function ProgramsActivitiesModule({
         : actForm.officeId || offices[0]?.id || '';
       const office = offices.find((o) => o.id === targetOfficeId);
       const now = new Date().toISOString();
-      const mappedClass = sourceOfFundToBudgetClass(actForm.sourceOfFund);
-      const cleanStartDate = actForm.startDate.trim() || undefined;
-      const rawEndDate = actForm.endDate.trim();
-      const cleanEndDate = rawEndDate
-        ? cleanStartDate && rawEndDate < cleanStartDate
-          ? cleanStartDate
-          : rawEndDate
-        : undefined;
+      const parentProg = programs.find((p) => p.id === actForm.programId);
+      const effectiveSource = editingActivity
+        ? editingActivity.sourceOfFund || actForm.sourceOfFund
+        : parentProg?.sourceOfFund?.trim() || actForm.sourceOfFund;
+      const mappedClass = sourceOfFundToBudgetClass(effectiveSource);
 
       const finalMonthlyExp = {
         ...monthlyExpenditures,
@@ -767,6 +791,17 @@ export function ProgramsActivitiesModule({
         ...monthlyPhysicalActuals,
         [actForm.month]: Math.max(0, safeNum(actForm.physicalActual)),
       };
+
+      const resolvedDescription = editingActivity
+        ? actForm.description.trim() ||
+          parentProg?.targetOutputs?.trim() ||
+          actForm.targetOutputs.trim() ||
+          parentProg?.title?.trim() ||
+          'Project / Activity'
+        : parentProg?.targetOutputs?.trim() ||
+          actForm.targetOutputs.trim() ||
+          parentProg?.title?.trim() ||
+          'Project / Activity';
 
       if (editingActivity) {
         const updatedMonthly = { ...editingActivity.monthly };
@@ -781,25 +816,29 @@ export function ProgramsActivitiesModule({
           ...editingActivity,
           programId: actForm.programId,
           subprogramId: actForm.subprogramId || null,
-          description: actForm.description.trim(),
+          description: resolvedDescription,
           targetOutputs: actForm.targetOutputs.trim(),
           officeId: office?.id || targetOfficeId,
           officeName: office?.name || userOfficeName || editingActivity.officeName,
-          sourceOfFund: editingActivity.sourceOfFund || actForm.sourceOfFund,
+          sourceOfFund: effectiveSource,
           budgetClassification: editingActivity.budgetClassification || mappedClass,
-          startDate: cleanStartDate,
-          endDate: cleanEndDate,
           monthly: updatedMonthly,
-          status: actForm.status,
+          status: editingActivity.status || parentProg?.status || 'PENDING',
           remarks: actForm.remarks.trim(),
+          evidence: actEvidenceDraft,
           updatedBy: userUid,
           updatedAt: now,
         });
       } else {
-        const parentProg = programs.find((p) => p.id === actForm.programId);
         const activeFy = parentProg?.fiscalYear || resolveActiveFiscalYear();
-        const siblingCount = activities.filter((a) => a.programId === actForm.programId).length;
-        const autoRefNumber = `${parentProg?.aipRefCode || 'PPA'}-${String(siblingCount + 1).padStart(2, '0')}`;
+        const siblings = activities.filter((a) => a.programId === actForm.programId);
+        const existingRefs = new Set(siblings.map((a) => a.referenceNumber.toLowerCase()));
+        let nextSeq = siblings.length + 1;
+        let autoRefNumber = `${parentProg?.aipRefCode || 'PPA'}-${String(nextSeq).padStart(2, '0')}`;
+        while (existingRefs.has(autoRefNumber.toLowerCase())) {
+          nextSeq += 1;
+          autoRefNumber = `${parentProg?.aipRefCode || 'PPA'}-${String(nextSeq).padStart(2, '0')}`;
+        }
 
         const monthly = createEmptyMonthlyData();
         for (const m of MONTHS) {
@@ -815,15 +854,13 @@ export function ProgramsActivitiesModule({
           subprogramId: actForm.subprogramId || null,
           fiscalYear: activeFy,
           referenceNumber: autoRefNumber,
-          description: actForm.description.trim(),
+          description: resolvedDescription,
           targetOutputs: actForm.targetOutputs.trim(),
           officeId: office?.id || targetOfficeId || '',
           officeName: office?.name || userOfficeName || 'MPDO',
-          sourceOfFund: actForm.sourceOfFund,
+          sourceOfFund: effectiveSource,
           budgetClassification: mappedClass,
-          orderIndex: siblingCount + 1,
-          startDate: cleanStartDate,
-          endDate: cleanEndDate,
+          orderIndex: nextSeq,
           gf: 0,
           ps: 0,
           mooe: 0,
@@ -835,9 +872,11 @@ export function ProgramsActivitiesModule({
           supplementalBudget4: 0,
           supplementalBudget5: 0,
           monthly,
-          status: actForm.status,
+          status: parentProg?.status || 'PENDING',
+          completionPct: 0,
           remarks: actForm.remarks.trim(),
           milestones: [],
+          evidence: actEvidenceDraft,
           createdBy: userUid,
           updatedBy: userUid,
           createdAt: now,
@@ -850,6 +889,34 @@ export function ProgramsActivitiesModule({
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleAddFormEvidence = () => {
+    const title = formEvTitle.trim();
+    const note = formEvNote.trim();
+    const url = formEvUrl.trim();
+    if (!title && !note && !url) {
+      setFormEvError('Provide a supporting note or external document link.');
+      return;
+    }
+    if (url && !isSafeExternalUrl(url)) {
+      setFormEvError('Document URL must start with https:// or http://');
+      return;
+    }
+    setFormEvError(null);
+    const nextItem: ActivityEvidenceItem = {
+      id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      title: title || (url ? 'External Document Link' : 'Supporting Note'),
+      note,
+      url,
+      addedByUid: userUid,
+      addedByName: userName || userOfficeName || 'Monitoring Personnel',
+      addedAt: new Date().toISOString(),
+    };
+    setActEvidenceDraft((prev) => [...prev, nextItem]);
+    setFormEvTitle('');
+    setFormEvNote('');
+    setFormEvUrl('');
   };
 
   const toggleCollapse = (id: string) => {
@@ -994,32 +1061,6 @@ export function ProgramsActivitiesModule({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {canEditStatusRemarks && onBulkUpdateActivityStatus && (
-              <div className="flex items-center gap-2">
-                <select
-                  aria-label="Bulk target status"
-                  value={bulkStatus}
-                  onChange={(e) => setBulkStatus(e.target.value as ImplementationStatus)}
-                  disabled={bulkBusy}
-                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-slate-900 dark:text-slate-100"
-                >
-                  {STATUS_OPTIONS.map((s) => (
-                    <option key={s} value={s}>
-                      {s}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  disabled={bulkBusy}
-                  onClick={handleApplyBulkStatus}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#2563EB] px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50 transition-colors"
-                >
-                  <span>{bulkBusy ? 'Updating...' : 'Apply Status'}</span>
-                </button>
-              </div>
-            )}
-
             {canEditStructure && onBulkDeleteActivities && (
               <button
                 type="button"
@@ -1128,9 +1169,17 @@ export function ProgramsActivitiesModule({
                           </>
                         )}
                       </div>
-                      <h3 className="text-[15px] sm:text-base font-semibold text-slate-900 dark:text-slate-100 truncate leading-snug">
+                      <h3 className="text-[15px] sm:text-base font-bold text-slate-900 dark:text-slate-100 truncate leading-snug">
                         {prog.title}
                       </h3>
+                      {prog.targetOutputs?.trim() && (
+                        <p className="mt-0.5 text-xs text-slate-600 dark:text-slate-400 truncate">
+                          <span className="font-medium text-slate-700 dark:text-slate-300">
+                            Target Outputs:
+                          </span>{' '}
+                          {prog.targetOutputs}
+                        </p>
+                      )}
                     </div>
                   </div>
 
@@ -1141,18 +1190,36 @@ export function ProgramsActivitiesModule({
                         {formatPHP(progSummary.approvedBudget)}
                       </p>
                       {safeNum(prog.supplementalBudget) !== 0 && (
-                        <p
-                          className={`font-mono text-[10px] font-semibold tabular-nums ${
-                            safeNum(prog.supplementalBudget) > 0
-                              ? 'text-emerald-600 dark:text-emerald-400'
-                              : 'text-red-600 dark:text-red-400'
-                          }`}
-                        >
-                          Supp:{' '}
-                          {safeNum(prog.supplementalBudget) > 0
-                            ? `+${formatPHP(safeNum(prog.supplementalBudget))}`
-                            : formatPHP(safeNum(prog.supplementalBudget))}
-                        </p>
+                        <div className="space-y-0.5">
+                          <p
+                            className={`font-mono text-[10px] font-semibold tabular-nums ${
+                              safeNum(prog.supplementalBudget) > 0
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-red-600 dark:text-red-400'
+                            }`}
+                          >
+                            Supp:{' '}
+                            {safeNum(prog.supplementalBudget) > 0
+                              ? `+${formatPHP(safeNum(prog.supplementalBudget))}`
+                              : formatPHP(safeNum(prog.supplementalBudget))}
+                          </p>
+                          {(() => {
+                            const activeSlots = getProgramSupplementalBreakdown(prog).orderedSlots.filter(
+                              (slot) => slot.amount !== 0
+                            );
+                            if (activeSlots.length === 0) return null;
+                            return (
+                              <p className="font-mono text-[9.5px] text-slate-500 dark:text-slate-400 tabular-nums">
+                                {activeSlots
+                                  .map(
+                                    (slot) =>
+                                      `SB${slot.slotNumber}: ${slot.amount > 0 ? `+${formatPHP(slot.amount)}` : formatPHP(slot.amount)}`
+                                  )
+                                  .join(' · ')}
+                              </p>
+                            );
+                          })()}
+                        </div>
                       )}
                     </div>
                     <div className="text-right">
@@ -1268,6 +1335,7 @@ export function ProgramsActivitiesModule({
                         </button>
                       </div>
                     )}
+                    <StatusBadge status={prog.status || 'PENDING'} compact />
                   </div>
                 </div>
 
@@ -1306,26 +1374,6 @@ export function ProgramsActivitiesModule({
                           <th className="py-2.5 px-4 text-right">
                             <button
                               type="button"
-                              onClick={() => toggleSort('approved')}
-                              className="inline-flex items-center gap-1 hover:text-slate-900 dark:hover:text-slate-100"
-                            >
-                              <span>Approved Budget</span>
-                              <ArrowUpDown className="h-3 w-3 opacity-60" />
-                            </button>
-                          </th>
-                          <th className="py-2.5 px-4 text-right">
-                            <button
-                              type="button"
-                              onClick={() => toggleSort('revised')}
-                              className="inline-flex items-center gap-1 hover:text-slate-900 dark:hover:text-slate-100"
-                            >
-                              <span>Revised Budget</span>
-                              <ArrowUpDown className="h-3 w-3 opacity-60" />
-                            </button>
-                          </th>
-                          <th className="py-2.5 px-4 text-right">
-                            <button
-                              type="button"
                               onClick={() => toggleSort('expenditure')}
                               className="inline-flex items-center gap-1 hover:text-slate-900 dark:hover:text-slate-100"
                             >
@@ -1334,17 +1382,6 @@ export function ProgramsActivitiesModule({
                             </button>
                           </th>
                           <th className="py-2.5 px-4 text-right">Physical Actual</th>
-                          <th className="py-2.5 px-4 text-right">Remaining Budget</th>
-                          <th className="py-2.5 px-4">
-                            <button
-                              type="button"
-                              onClick={() => toggleSort('status')}
-                              className="inline-flex items-center gap-1 hover:text-slate-900 dark:hover:text-slate-100"
-                            >
-                              <span>Status</span>
-                              <ArrowUpDown className="h-3 w-3 opacity-60" />
-                            </button>
-                          </th>
                           <th className="py-2.5 px-4 text-right">Actions</th>
                         </tr>
                       </thead>
@@ -1352,7 +1389,7 @@ export function ProgramsActivitiesModule({
                         {directActivities.length === 0 && subprogs.length === 0 ? (
                           <tr>
                             <td
-                              colSpan={canBulkSelect ? 13 : 12}
+                              colSpan={canBulkSelect ? 9 : 8}
                               className="py-5 px-4 text-center text-xs text-slate-500 dark:text-slate-400"
                             >
                               No matching projects or activities under this program.
@@ -1420,7 +1457,9 @@ export function ProgramsActivitiesModule({
                                     </div>
                                   </td>
                                   <td className="py-2.5 px-4 font-medium text-slate-900 dark:text-slate-100 max-w-xs">
-                                    <div className="line-clamp-2">{act.description}</div>
+                                    <div className="line-clamp-2">
+                                      {act.description || prog.targetOutputs || '—'}
+                                    </div>
                                   </td>
                                   <td className="py-2.5 px-4 text-xs text-slate-600 dark:text-slate-400 max-w-[200px]">
                                     {act.targetOutputs}
@@ -1431,42 +1470,30 @@ export function ProgramsActivitiesModule({
                                   <td className="py-2.5 px-4 font-mono text-xs text-slate-700 dark:text-slate-300 whitespace-nowrap">
                                     {act.budgetClassification}
                                   </td>
-                                  <td className="py-2.5 px-4 text-right font-mono text-xs text-slate-800 dark:text-slate-200 tabular-nums whitespace-nowrap">
-                                    {formatPHP(bd.approvedBudget)}
-                                  </td>
-                                  <td className="py-2.5 px-4 text-right font-mono text-xs font-semibold text-[#163A5F] dark:text-sky-400 tabular-nums whitespace-nowrap">
-                                    {formatPHP(bd.revisedBudget)}
-                                  </td>
                                   <td className="py-2.5 px-4 text-right font-mono text-xs text-slate-700 dark:text-slate-300 tabular-nums whitespace-nowrap">
                                     {formatPHP(bd.expenditure)}
                                   </td>
                                   <td className="py-2.5 px-4 text-right font-mono text-xs text-slate-700 dark:text-slate-300 tabular-nums whitespace-nowrap">
                                     {formatQty(act.annualPhysicalActual)}
                                   </td>
-                                  <td
-                                    className={`py-2.5 px-4 text-right font-mono text-xs font-semibold tabular-nums whitespace-nowrap ${
-                                      bd.remainingBudget < 0
-                                        ? 'text-red-600 dark:text-red-400'
-                                        : 'text-emerald-600 dark:text-emerald-400'
-                                    }`}
-                                  >
-                                    <span>{formatPHP(bd.remainingBudget)}</span>
-                                    {bd.remainingBudget < 0 && (
-                                      <span className="ml-1.5 inline-block rounded bg-red-100 dark:bg-red-950 px-1.5 py-0.5 text-[10px] font-bold uppercase text-red-700 dark:text-red-300">
-                                        Over
-                                      </span>
-                                    )}
-                                  </td>
-                                  <td className="py-2.5 px-4">
-                                    <StatusBadge status={act.status} compact />
-                                  </td>
                                   <td className="py-2.5 px-4 text-right whitespace-nowrap">
                                     <div className="inline-flex items-center gap-1">
+                                      {(act.evidence?.length || 0) > 0 && (
+                                        <button
+                                          type="button"
+                                          onClick={() => setDetailActivity(act)}
+                                          className="inline-flex items-center gap-1 rounded-md bg-blue-50 dark:bg-sky-950/60 px-1.5 py-1 text-[11px] font-semibold text-[#2563EB] dark:text-sky-300 hover:bg-blue-100 dark:hover:bg-sky-900/70"
+                                          title={`${act.evidence!.length} evidence attachment(s) — click to view`}
+                                        >
+                                          <Paperclip className="h-3 w-3" aria-hidden="true" />
+                                          <span>{act.evidence!.length}</span>
+                                        </button>
+                                      )}
                                       <button
                                         type="button"
                                         onClick={() => setDetailActivity(act)}
                                         className="rounded-lg p-1.5 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-                                        title="View details"
+                                        title="View details, milestones & evidence"
                                       >
                                         <Eye className="h-4 w-4" />
                                       </button>
@@ -1515,7 +1542,7 @@ export function ProgramsActivitiesModule({
                                       {sub.aipRefCode}
                                     </td>
                                     <td
-                                      colSpan={10}
+                                      colSpan={6}
                                       className="py-2 px-4 text-xs font-bold text-[#163A5F] dark:text-sky-400"
                                     >
                                       Subprogram: {sub.title}
@@ -1618,7 +1645,7 @@ export function ProgramsActivitiesModule({
                                           </div>
                                         </td>
                                         <td className="py-2.5 px-4 font-medium text-slate-900 dark:text-slate-100">
-                                          {act.description}
+                                          {act.description || prog.targetOutputs || '—'}
                                         </td>
                                         <td className="py-2.5 px-4 text-xs text-slate-600 dark:text-slate-400">
                                           {act.targetOutputs}
@@ -1629,42 +1656,30 @@ export function ProgramsActivitiesModule({
                                         <td className="py-2.5 px-4 font-mono text-xs text-slate-700 dark:text-slate-300">
                                           {act.budgetClassification}
                                         </td>
-                                        <td className="py-2.5 px-4 text-right font-mono text-xs text-slate-800 dark:text-slate-200 tabular-nums whitespace-nowrap">
-                                          {formatPHP(bd.approvedBudget)}
-                                        </td>
-                                        <td className="py-2.5 px-4 text-right font-mono text-xs font-semibold text-[#163A5F] dark:text-sky-400 tabular-nums whitespace-nowrap">
-                                          {formatPHP(bd.revisedBudget)}
-                                        </td>
                                         <td className="py-2.5 px-4 text-right font-mono text-xs text-slate-700 dark:text-slate-300 tabular-nums whitespace-nowrap">
                                           {formatPHP(bd.expenditure)}
                                         </td>
                                         <td className="py-2.5 px-4 text-right font-mono text-xs text-slate-700 dark:text-slate-300 tabular-nums whitespace-nowrap">
                                           {formatQty(act.annualPhysicalActual)}
                                         </td>
-                                        <td
-                                          className={`py-2.5 px-4 text-right font-mono text-xs font-semibold tabular-nums whitespace-nowrap ${
-                                            bd.remainingBudget < 0
-                                              ? 'text-red-600 dark:text-red-400'
-                                              : 'text-emerald-600 dark:text-emerald-400'
-                                          }`}
-                                        >
-                                          <span>{formatPHP(bd.remainingBudget)}</span>
-                                          {bd.remainingBudget < 0 && (
-                                            <span className="ml-1.5 inline-block rounded bg-red-100 dark:bg-red-950 px-1.5 py-0.5 text-[10px] font-bold uppercase text-red-700 dark:text-red-300">
-                                              Over
-                                            </span>
-                                          )}
-                                        </td>
-                                        <td className="py-2.5 px-4">
-                                          <StatusBadge status={act.status} compact />
-                                        </td>
                                         <td className="py-2.5 px-4 text-right whitespace-nowrap">
                                           <div className="inline-flex items-center gap-1">
+                                            {(act.evidence?.length || 0) > 0 && (
+                                              <button
+                                                type="button"
+                                                onClick={() => setDetailActivity(act)}
+                                                className="inline-flex items-center gap-1 rounded-md bg-blue-50 dark:bg-sky-950/60 px-1.5 py-1 text-[11px] font-semibold text-[#2563EB] dark:text-sky-300 hover:bg-blue-100 dark:hover:bg-sky-900/70"
+                                                title={`${act.evidence!.length} evidence attachment(s) — click to view`}
+                                              >
+                                                <Paperclip className="h-3 w-3" aria-hidden="true" />
+                                                <span>{act.evidence!.length}</span>
+                                              </button>
+                                            )}
                                             <button
                                               type="button"
                                               onClick={() => setDetailActivity(act)}
                                               className="rounded-lg p-1.5 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-                                              title="View Details"
+                                              title="View Details, Milestones & Evidence"
                                               aria-label={`View details for ${act.referenceNumber}`}
                                             >
                                               <Eye className="h-4 w-4" />
@@ -1776,6 +1791,19 @@ export function ProgramsActivitiesModule({
                   onChange={(e) => setProgForm({ ...progForm, title: e.target.value })}
                   className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
                   placeholder="e.g., Agricultural Productivity & Infrastructure Program"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">
+                  Target Outputs
+                </label>
+                <input
+                  type="text"
+                  value={progForm.targetOutputs}
+                  onChange={(e) => setProgForm({ ...progForm, targetOutputs: e.target.value })}
+                  className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                  placeholder="Enter target outputs (e.g., 500 Farmers Assisted / 2 Road Segments)"
                 />
               </div>
 
@@ -1912,26 +1940,53 @@ export function ProgramsActivitiesModule({
                 </div>
               </div>
 
-              <div>
-                <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">Lead Office</label>
-                <select
-                  disabled={isOfficeScoped}
-                  value={
-                    isOfficeScoped
-                      ? userOfficeId
-                      : offices.some((o) => o.id === progForm.officeId)
-                        ? progForm.officeId
-                        : offices[0]?.id || ''
-                  }
-                  onChange={(e) => setProgForm({ ...progForm, officeId: e.target.value })}
-                  className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:bg-slate-100 dark:disabled:bg-slate-800/50"
-                >
-                  {offices.map((o) => (
-                    <option key={o.id} value={o.id}>
-                      {o.code} — {o.name}
-                    </option>
-                  ))}
-                </select>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">
+                    Lead Office
+                  </label>
+                  <select
+                    disabled={isOfficeScoped}
+                    value={
+                      isOfficeScoped
+                        ? userOfficeId
+                        : offices.some((o) => o.id === progForm.officeId)
+                          ? progForm.officeId
+                          : offices[0]?.id || ''
+                    }
+                    onChange={(e) => setProgForm({ ...progForm, officeId: e.target.value })}
+                    className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:bg-slate-100 dark:disabled:bg-slate-800/50"
+                  >
+                    {offices.map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {o.code} — {o.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[13px] font-medium text-slate-700 dark:text-slate-300">
+                    Accomplishment Status *
+                  </label>
+                  <select
+                    required
+                    value={progForm.status}
+                    onChange={(e) =>
+                      setProgForm({
+                        ...progForm,
+                        status: e.target.value as ImplementationStatus,
+                      })
+                    }
+                    className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
+                  >
+                    {STATUS_OPTIONS.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               {/* Monthly Physical Target Breakdown (Jan–Dec) */}
@@ -2051,10 +2106,8 @@ export function ProgramsActivitiesModule({
                       programId: nextProgId,
                       subprogramId: '',
                       sourceOfFund:
-                        !editingActivity &&
-                        nextProg?.sourceOfFund &&
-                        SOURCE_OF_FUND_OPTIONS.includes(nextProg.sourceOfFund)
-                          ? nextProg.sourceOfFund
+                        !editingActivity && nextProg?.sourceOfFund?.trim()
+                          ? nextProg.sourceOfFund.trim()
                           : prev.sourceOfFund,
                     }));
                   }}
@@ -2129,21 +2182,6 @@ export function ProgramsActivitiesModule({
 
               <div>
                 <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Target Outputs *
-                </label>
-                <input
-                  required
-                  disabled={!canEditStructure}
-                  type="text"
-                  value={actForm.description}
-                  onChange={(e) => setActForm({ ...actForm, description: e.target.value })}
-                  className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:bg-slate-100 dark:disabled:bg-slate-800/50"
-                  placeholder="Enter target outputs (e.g., 500 Farmers Assisted / 2 Road Segments)"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
                   Actual Output
                 </label>
                 <input
@@ -2156,19 +2194,17 @@ export function ProgramsActivitiesModule({
                 />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
                     Source of Fund *
-                    {editingActivity && (
-                      <span className="ml-1.5 text-[10px] font-normal text-slate-400 dark:text-slate-500">
-                        (Locked on edit)
-                      </span>
-                    )}
+                    <span className="ml-1.5 text-[10px] font-normal text-slate-400 dark:text-slate-500">
+                      {editingActivity ? '(Locked on edit)' : '(Inherited from Program)'}
+                    </span>
                   </label>
                   <select
                     required
-                    disabled={!canEditStructure || Boolean(editingActivity)}
+                    disabled
                     value={actForm.sourceOfFund}
                     onChange={(e) => setActForm({ ...actForm, sourceOfFund: e.target.value })}
                     className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:cursor-not-allowed disabled:bg-slate-100 dark:disabled:bg-slate-800/50 disabled:text-slate-500 dark:disabled:text-slate-400"
@@ -2197,24 +2233,6 @@ export function ProgramsActivitiesModule({
                     {offices.map((o) => (
                       <option key={o.id} value={o.id}>
                         {o.code} — {o.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                    Implementation Status
-                  </label>
-                  <select
-                    value={actForm.status}
-                    onChange={(e) =>
-                      setActForm({ ...actForm, status: e.target.value as ImplementationStatus })
-                    }
-                    className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
-                  >
-                    {STATUS_OPTIONS.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
                       </option>
                     ))}
                   </select>
@@ -2365,40 +2383,6 @@ export function ProgramsActivitiesModule({
                 })()}
               </div>
 
-              {/* Implementation Schedule (Start Date & End Date) */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                    Start Date <span className="text-[11px] font-normal text-slate-400">(optional)</span>
-                  </label>
-                  <input
-                    type="date"
-                    value={actForm.startDate}
-                    onChange={(e) => {
-                      const nextStart = e.target.value;
-                      setActForm((prev) => ({
-                        ...prev,
-                        startDate: nextStart,
-                        endDate: prev.endDate && nextStart && prev.endDate < nextStart ? nextStart : prev.endDate,
-                      }));
-                    }}
-                    className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">
-                    End Date <span className="text-[11px] font-normal text-slate-400">(optional)</span>
-                  </label>
-                  <input
-                    type="date"
-                    min={actForm.startDate || undefined}
-                    value={actForm.endDate}
-                    onChange={(e) => setActForm((prev) => ({ ...prev, endDate: e.target.value }))}
-                    className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm font-mono text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
-                  />
-                </div>
-              </div>
-
               <div>
                 <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Remarks</label>
                 <textarea
@@ -2408,6 +2392,104 @@ export function ProgramsActivitiesModule({
                   className="mt-1 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none"
                   placeholder="Implementation notes or observations..."
                 />
+              </div>
+
+              {/* Supporting Evidence Notes & External Document Links */}
+              <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 p-3.5 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <Paperclip className="h-3.5 w-3.5 text-[#2563EB] dark:text-sky-400" aria-hidden="true" />
+                    <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                      Evidence Notes &amp; Document Links ({actEvidenceDraft.length})
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Optional notes or external URLs (http/https)
+                  </span>
+                </div>
+
+                {actEvidenceDraft.length > 0 && (
+                  <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                    {actEvidenceDraft.map((ev) => (
+                      <div
+                        key={ev.id}
+                        className="flex items-start justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-xs"
+                      >
+                        <div className="min-w-0 space-y-0.5">
+                          <p className="font-semibold text-slate-800 dark:text-slate-100">
+                            {ev.title || (ev.url ? 'External Document Link' : 'Supporting Note')}
+                          </p>
+                          {ev.note && (
+                            <p className="text-slate-600 dark:text-slate-300 whitespace-pre-wrap break-words">
+                              {ev.note}
+                            </p>
+                          )}
+                          {ev.url && isSafeExternalUrl(ev.url) && (
+                            <a
+                              href={ev.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-[11px] font-medium text-[#2563EB] dark:text-sky-400 hover:underline break-all"
+                            >
+                              <Link2 className="h-3 w-3 shrink-0" aria-hidden="true" />
+                              <span>{ev.url}</span>
+                              <ExternalLink className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
+                            </a>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setActEvidenceDraft((prev) => prev.filter((item) => item.id !== ev.id))
+                          }
+                          className="rounded p-1 text-slate-400 hover:bg-red-50 dark:hover:bg-red-950/40 hover:text-red-600 dark:hover:text-red-400"
+                          title="Remove evidence attachment"
+                          aria-label={`Remove ${ev.title || 'evidence'}`}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {formEvError && (
+                  <p className="text-xs font-medium text-red-600 dark:text-red-400">{formEvError}</p>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    type="text"
+                    value={formEvTitle}
+                    onChange={(e) => setFormEvTitle(e.target.value)}
+                    placeholder="Document / note label (e.g., Inspection Report)"
+                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-[#2563EB] focus:outline-none"
+                  />
+                  <input
+                    type="url"
+                    value={formEvUrl}
+                    onChange={(e) => setFormEvUrl(e.target.value)}
+                    placeholder="External document URL (https://...)"
+                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-[#2563EB] focus:outline-none"
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    value={formEvNote}
+                    onChange={(e) => setFormEvNote(e.target.value)}
+                    placeholder="Supporting text note or reference details..."
+                    className="flex-1 min-w-[200px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-[#2563EB] focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddFormEvidence}
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
+                  >
+                    <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Attach Note / URL</span>
+                  </button>
+                </div>
               </div>
 
               <div className="flex justify-end gap-3 pt-3 border-t border-slate-200 dark:border-slate-800">
@@ -2507,6 +2589,69 @@ export function ProgramsActivitiesModule({
 
         const handleDeleteMilestone = async (milestoneId: string) => {
           await persistMilestones(milestones.filter((m) => m.id !== milestoneId));
+        };
+
+        const evidenceItems = Array.isArray(liveDetailActivity.evidence)
+          ? liveDetailActivity.evidence
+          : [];
+
+        const persistEvidence = async (nextEvidence: ActivityEvidenceItem[]) => {
+          setEvidenceBusy(true);
+          setEvidenceError(null);
+          try {
+            const now = new Date().toISOString();
+            const updated: Activity = {
+              ...liveDetailActivity,
+              evidence: nextEvidence,
+              updatedBy: userUid,
+              updatedAt: now,
+            };
+            await onUpdateActivity(updated);
+            setDetailActivity({
+              ...liveDetailActivity,
+              evidence: nextEvidence,
+              updatedBy: userUid,
+              updatedAt: now,
+            });
+          } catch (err) {
+            setEvidenceError(
+              err instanceof Error ? err.message : 'Unable to save evidence attachment.'
+            );
+          } finally {
+            setEvidenceBusy(false);
+          }
+        };
+
+        const handleAddEvidence = async (e: React.FormEvent) => {
+          e.preventDefault();
+          const title = newEvidenceTitle.trim();
+          const note = newEvidenceNote.trim();
+          const url = newEvidenceUrl.trim();
+          if (!title && !note && !url) {
+            setEvidenceError('Provide a supporting note or external document link.');
+            return;
+          }
+          if (url && !isSafeExternalUrl(url)) {
+            setEvidenceError('Document URL must be a valid https:// or http:// link.');
+            return;
+          }
+          const nextItem: ActivityEvidenceItem = {
+            id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            title: title || (url ? 'External Document Link' : 'Supporting Note'),
+            note,
+            url,
+            addedByUid: userUid,
+            addedByName: userName || userOfficeName || 'Monitoring Personnel',
+            addedAt: new Date().toISOString(),
+          };
+          await persistEvidence([...evidenceItems, nextItem]);
+          setNewEvidenceTitle('');
+          setNewEvidenceNote('');
+          setNewEvidenceUrl('');
+        };
+
+        const handleDeleteEvidence = async (evidenceId: string) => {
+          await persistEvidence(evidenceItems.filter((item) => item.id !== evidenceId));
         };
 
         const parentProg = programs.find((p) => p.id === liveDetailActivity.programId);
@@ -2806,6 +2951,136 @@ export function ProgramsActivitiesModule({
                     )}
                   </div>
 
+                  {/* Evidence Notes & External Document Links */}
+                  <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h4 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-700 dark:text-slate-200">
+                          <Paperclip className="h-3.5 w-3.5 text-[#2563EB] dark:text-sky-400" aria-hidden="true" />
+                          <span>Evidence Notes &amp; Supporting Document Links</span>
+                        </h4>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Attach verification notes or external document URLs for evidence-based reporting
+                        </p>
+                      </div>
+                      <span className="font-mono text-xs font-semibold text-[#163A5F] dark:text-sky-400 tabular-nums">
+                        {evidenceItems.length} {evidenceItems.length === 1 ? 'attachment' : 'attachments'}
+                      </span>
+                    </div>
+
+                    {evidenceError && (
+                      <div
+                        role="alert"
+                        className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 px-3 py-1.5 text-xs text-red-700 dark:text-red-300"
+                      >
+                        {evidenceError}
+                      </div>
+                    )}
+
+                    {evidenceItems.length === 0 ? (
+                      <p className="text-xs text-slate-500 dark:text-slate-400 py-1">
+                        No supporting notes or external document links attached yet.
+                      </p>
+                    ) : (
+                      <div className="divide-y divide-slate-200/80 dark:divide-slate-700/80 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                        {evidenceItems.map((ev) => (
+                          <div
+                            key={ev.id}
+                            className="flex items-start justify-between gap-3 px-3 py-2.5 text-xs"
+                          >
+                            <div className="min-w-0 space-y-1 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <FileText className="h-3.5 w-3.5 shrink-0 text-[#163A5F] dark:text-sky-400" aria-hidden="true" />
+                                <span className="font-semibold text-slate-900 dark:text-slate-100 break-words">
+                                  {ev.title || (ev.url ? 'External Document Link' : 'Supporting Note')}
+                                </span>
+                                <span className="text-[10px] text-slate-400 dark:text-slate-500 font-mono">
+                                  {ev.addedByName ? `${ev.addedByName} · ` : ''}
+                                  {ev.addedAt ? new Date(ev.addedAt).toLocaleDateString('en-PH') : ''}
+                                </span>
+                              </div>
+                              {ev.note && (
+                                <p className="text-slate-600 dark:text-slate-300 whitespace-pre-wrap break-words leading-relaxed">
+                                  {ev.note}
+                                </p>
+                              )}
+                              {ev.url && isSafeExternalUrl(ev.url) && (
+                                <a
+                                  href={ev.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1.5 font-medium text-[#2563EB] dark:text-sky-400 hover:underline break-all"
+                                >
+                                  <Link2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                                  <span>{ev.url}</span>
+                                  <ExternalLink className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                </a>
+                              )}
+                            </div>
+                            {canEditStructure && (
+                              <button
+                                type="button"
+                                disabled={evidenceBusy}
+                                onClick={() => void handleDeleteEvidence(ev.id)}
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 dark:hover:bg-red-950/40 hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50"
+                                title="Remove evidence attachment"
+                                aria-label={`Remove ${ev.title || 'evidence'}`}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {canEditStructure && (
+                      <form onSubmit={handleAddEvidence} className="space-y-2 pt-1">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <input
+                            type="text"
+                            value={newEvidenceTitle}
+                            onChange={(e) => setNewEvidenceTitle(e.target.value)}
+                            placeholder="Label / Title (e.g., Accomplishment Report, Site Photos)"
+                            disabled={evidenceBusy}
+                            className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-[#2563EB] focus:outline-none"
+                          />
+                          <input
+                            type="url"
+                            value={newEvidenceUrl}
+                            onChange={(e) => setNewEvidenceUrl(e.target.value)}
+                            placeholder="External document URL (https://...)"
+                            disabled={evidenceBusy}
+                            className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-[#2563EB] focus:outline-none"
+                          />
+                        </div>
+                        <div className="flex flex-wrap items-start gap-2">
+                          <textarea
+                            rows={2}
+                            value={newEvidenceNote}
+                            onChange={(e) => setNewEvidenceNote(e.target.value)}
+                            placeholder="Attach supporting note, document reference, or verification summary..."
+                            disabled={evidenceBusy}
+                            className="flex-1 min-w-[220px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-[#2563EB] focus:outline-none"
+                          />
+                          <button
+                            type="submit"
+                            disabled={
+                              evidenceBusy ||
+                              (!newEvidenceTitle.trim() &&
+                                !newEvidenceNote.trim() &&
+                                !newEvidenceUrl.trim())
+                            }
+                            className="inline-flex items-center gap-1 rounded-lg bg-[#163A5F] hover:bg-[#1E4D7B] dark:bg-[#2563EB] dark:hover:bg-[#1D4ED8] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-45 transition-colors"
+                          >
+                            <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                            <span>{evidenceBusy ? 'Saving...' : 'Attach Evidence'}</span>
+                          </button>
+                        </div>
+                      </form>
+                    )}
+                  </div>
+
                   {/* Visual Lifecycle & Progress Timeline Chart */}
                   <PpaTimelineChart
                     activity={liveDetailActivity}
@@ -2840,9 +3115,9 @@ export function ProgramsActivitiesModule({
                   )}
 
                   <div>
-                    <span className="text-xs text-slate-500 dark:text-slate-400">Current Status &amp; Remarks</span>
+                    <span className="text-xs text-slate-500 dark:text-slate-400">Program Accomplishment Status &amp; Activity Remarks</span>
                     <div className="mt-1 flex flex-wrap items-center gap-3">
-                      <StatusBadge status={liveDetailActivity.status} />
+                      <StatusBadge status={parentProg?.status || liveDetailActivity.status} />
                       <span className="text-sm text-slate-700 dark:text-slate-300">
                         {liveDetailActivity.remarks || 'No remarks recorded.'}
                       </span>

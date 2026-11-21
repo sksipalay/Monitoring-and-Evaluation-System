@@ -154,6 +154,9 @@ export function UserManagementModule({
   const [auditSearch, setAuditSearch] = useState('');
   const [auditSearchInput, setAuditSearchInput] = useState('');
   const [auditActionFilter, setAuditActionFilter] = useState('ALL');
+  const [auditUserFilter, setAuditUserFilter] = useState('ALL');
+  const [auditDateFrom, setAuditDateFrom] = useState('');
+  const [auditDateTo, setAuditDateTo] = useState('');
   const [auditPage, setAuditPage] = useState(1);
   const [auditPageData, setAuditPageData] = useState<{
     rows: AuditLog[];
@@ -231,6 +234,32 @@ export function UserManagementModule({
     [users, officeFilter, approvalFilter]
   );
 
+  const auditUserOptions = useMemo(() => {
+    const map = new Map<string, { uid: string; label: string }>();
+    for (const u of users) {
+      map.set(u.uid, {
+        uid: u.uid,
+        label: `${u.displayName} (${u.email})`,
+      });
+    }
+    for (const log of auditLogs) {
+      if (log.userUid && !map.has(log.userUid)) {
+        map.set(log.userUid, {
+          uid: log.userUid,
+          label: log.userName ? `${log.userName} (${log.userEmail || log.userUid})` : log.userUid,
+        });
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label));
+  }, [users, auditLogs]);
+
+  const hasActiveAuditFilters =
+    Boolean(auditSearch.trim()) ||
+    auditActionFilter !== 'ALL' ||
+    auditUserFilter !== 'ALL' ||
+    Boolean(auditDateFrom) ||
+    Boolean(auditDateTo);
+
   const fetchPaginatedAudits = useCallback(async () => {
     if (!isAdmin) return;
     setAuditPageData((prev) => ({ ...prev, loading: true }));
@@ -240,6 +269,10 @@ export function UserManagementModule({
         pageSize: 25,
         action: auditActionFilter,
         search: auditSearch,
+        userUid: auditUserFilter,
+        dateFrom: auditDateFrom,
+        dateTo: auditDateTo,
+        tzOffsetMinutes: new Date().getTimezoneOffset(),
       });
       setAuditPageData({
         rows: res.auditLogs,
@@ -250,7 +283,15 @@ export function UserManagementModule({
     } catch {
       setAuditPageData((prev) => ({ ...prev, loading: false }));
     }
-  }, [isAdmin, auditPage, auditActionFilter, auditSearch]);
+  }, [
+    isAdmin,
+    auditPage,
+    auditActionFilter,
+    auditSearch,
+    auditUserFilter,
+    auditDateFrom,
+    auditDateTo,
+  ]);
 
   const fetchSessionsOverview = useCallback(async () => {
     if (!isAdmin) return;
@@ -1223,64 +1264,168 @@ export function UserManagementModule({
         </div>
       ) : (
         <div className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+          <div className="flex flex-wrap items-end justify-between gap-3 rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
             <form
               onSubmit={(e) => {
                 e.preventDefault();
                 setAuditPage(1);
                 setAuditSearch(auditSearchInput);
               }}
-              className="flex flex-wrap items-center gap-3 flex-1"
+              className="flex flex-wrap items-end gap-2.5 flex-1"
             >
-              <div className="relative flex-1 min-w-0 sm:min-w-[220px] max-w-sm">
-                <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
-                <input
-                  type="text"
-                  value={auditSearchInput}
+              <div className="relative flex-1 min-w-[200px] max-w-xs">
+                <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
+                  Keyword Search
+                </label>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+                  <input
+                    type="text"
+                    value={auditSearchInput}
+                    onChange={(e) => {
+                      setAuditSearchInput(e.target.value);
+                      if (!e.target.value.trim()) {
+                        setAuditPage(1);
+                        setAuditSearch('');
+                      }
+                    }}
+                    placeholder="Search summary, entity, email..."
+                    className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 pl-9 pr-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+                  />
+                </div>
+              </div>
+
+              <div className="min-w-[180px] max-w-[240px]">
+                <label
+                  htmlFor="audit-user-filter"
+                  className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+                >
+                  User
+                </label>
+                <select
+                  id="audit-user-filter"
+                  aria-label="Filter audit logs by user"
+                  value={auditUserFilter}
                   onChange={(e) => {
-                    setAuditSearchInput(e.target.value);
-                    if (!e.target.value.trim()) {
-                      setAuditPage(1);
-                      setAuditSearch('');
-                    }
+                    setAuditUserFilter(e.target.value);
+                    setAuditPage(1);
                   }}
-                  placeholder="Search user, action, summary (Enter)..."
-                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 pl-9 pr-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+                  className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+                >
+                  <option value="ALL">All Users</option>
+                  {auditUserOptions.map((u) => (
+                    <option key={u.uid} value={u.uid}>
+                      {u.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="audit-action-filter"
+                  className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+                >
+                  Action Type
+                </label>
+                <select
+                  id="audit-action-filter"
+                  aria-label="Filter audit logs by action type"
+                  value={auditActionFilter}
+                  onChange={(e) => {
+                    setAuditActionFilter(e.target.value);
+                    setAuditPage(1);
+                  }}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
+                >
+                  <option value="ALL">All Actions</option>
+                  {[
+                    'CREATE',
+                    'UPDATE',
+                    'DELETE',
+                    'STATUS_CHANGE',
+                    'IMPORT',
+                    'EXPORT',
+                    'LOGIN',
+                    'AUTH_FAILED',
+                    'SETTINGS',
+                    'BACKUP',
+                    'RESTORE',
+                  ].map((a) => (
+                    <option key={a} value={a}>
+                      {a}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="audit-date-from"
+                  className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+                >
+                  From Date
+                </label>
+                <input
+                  id="audit-date-from"
+                  type="date"
+                  aria-label="Filter audit logs from date"
+                  value={auditDateFrom}
+                  max={auditDateTo || undefined}
+                  onChange={(e) => {
+                    setAuditDateFrom(e.target.value);
+                    setAuditPage(1);
+                  }}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-2.5 py-1.5 text-sm font-mono focus:border-[#2563EB] focus:outline-none transition-colors"
                 />
               </div>
-              <select
-                value={auditActionFilter}
-                onChange={(e) => {
-                  setAuditActionFilter(e.target.value);
-                  setAuditPage(1);
-                }}
-                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
-              >
-                <option value="ALL">All Actions</option>
-                {[
-                  'CREATE',
-                  'UPDATE',
-                  'DELETE',
-                  'STATUS_CHANGE',
-                  'IMPORT',
-                  'EXPORT',
-                  'LOGIN',
-                  'AUTH_FAILED',
-                  'SETTINGS',
-                  'BACKUP',
-                  'RESTORE',
-                ].map((a) => (
-                  <option key={a} value={a}>
-                    {a}
-                  </option>
-                ))}
-              </select>
+
+              <div>
+                <label
+                  htmlFor="audit-date-to"
+                  className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+                >
+                  To Date
+                </label>
+                <input
+                  id="audit-date-to"
+                  type="date"
+                  aria-label="Filter audit logs to date"
+                  value={auditDateTo}
+                  min={auditDateFrom || undefined}
+                  onChange={(e) => {
+                    setAuditDateTo(e.target.value);
+                    setAuditPage(1);
+                  }}
+                  className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-2.5 py-1.5 text-sm font-mono focus:border-[#2563EB] focus:outline-none transition-colors"
+                />
+              </div>
+
               <button
                 type="submit"
                 className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700"
               >
-                Filter
+                Apply Search
               </button>
+
+              {hasActiveAuditFilters && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuditSearchInput('');
+                    setAuditSearch('');
+                    setAuditActionFilter('ALL');
+                    setAuditUserFilter('ALL');
+                    setAuditDateFrom('');
+                    setAuditDateTo('');
+                    setAuditPage(1);
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700"
+                >
+                  <X className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Clear</span>
+                </button>
+              )}
             </form>
 
             <button

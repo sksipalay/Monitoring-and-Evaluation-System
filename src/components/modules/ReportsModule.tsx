@@ -131,29 +131,48 @@ export function ReportsModule({
     }
   }, [fyPrograms, programFilter]);
 
+  const programMap = useMemo(
+    () => new Map(programs.map((p) => [p.id, p])),
+    [programs]
+  );
+
   const filteredActivities = useMemo(() => {
     return activities.filter((a) => {
       if (fyFilter !== 'ALL' && a.fiscalYear !== fyFilter) return false;
       if (programFilter !== 'ALL' && a.programId !== programFilter) return false;
-      if (statusFilter !== 'ALL' && a.status !== statusFilter) return false;
-      if (reportType === 'completed_activities' && a.status !== 'COMPLETED') return false;
+      const effStatus = programMap.get(a.programId)?.status || a.status || 'PENDING';
+      if (statusFilter !== 'ALL' && effStatus !== statusFilter) return false;
+      if (reportType === 'completed_activities' && effStatus !== 'COMPLETED') return false;
       if (
         reportType === 'pending_not_implemented' &&
-        a.status !== 'PENDING' &&
-        a.status !== 'NOT IMPLEMENTED'
+        effStatus !== 'PENDING' &&
+        effStatus !== 'NOT IMPLEMENTED'
       ) {
         return false;
       }
       return true;
     });
-  }, [activities, fyFilter, programFilter, statusFilter, reportType]);
+  }, [activities, programMap, fyFilter, programFilter, statusFilter, reportType]);
 
   const scopedProgramsForReport = useMemo(
     () =>
       reportType === 'gad_compliance'
         ? fyPrograms
-        : fyPrograms.filter((p) => programFilter === 'ALL' || p.id === programFilter),
-    [reportType, fyPrograms, programFilter]
+        : fyPrograms.filter((p) => {
+            if (programFilter !== 'ALL' && p.id !== programFilter) return false;
+            const progStatus = p.status || 'PENDING';
+            if (statusFilter !== 'ALL' && progStatus !== statusFilter) return false;
+            if (reportType === 'completed_activities' && progStatus !== 'COMPLETED') return false;
+            if (
+              reportType === 'pending_not_implemented' &&
+              progStatus !== 'PENDING' &&
+              progStatus !== 'NOT IMPLEMENTED'
+            ) {
+              return false;
+            }
+            return true;
+          }),
+    [reportType, fyPrograms, programFilter, statusFilter]
   );
 
   const eligibleTemplates = useMemo(

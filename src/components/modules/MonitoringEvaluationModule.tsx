@@ -200,7 +200,7 @@ export function MonitoringEvaluationModule({
         officeName: officeNames.join(', '),
         targetOutputs: actualOutputsList.join(' / '),
         remarks: remarksList.join(' · '),
-        status: resolveMergedStatus(groupItems),
+        status: programMap.get(primary.programId)?.status || resolveMergedStatus(groupItems),
         gf,
         ps,
         mooe,
@@ -406,6 +406,40 @@ export function MonitoringEvaluationModule({
                 const parentProg = programMap.get(selectedActivity.programId);
                 const progSum = programSummaryMap.get(selectedActivity.programId);
                 const bd = resolveActivityBudgetDisplay(selectedActivity, parentProg, progSum);
+                const monthlyRows = MONTHS.reduce<
+                  {
+                    month: (typeof MONTHS)[number];
+                    entry: (typeof selectedActivity.monthly)[typeof MONTHS[number]['key']];
+                    totalExpenditure: number;
+                    rawCumulativePct: number;
+                    cappedAccompPct: number;
+                  }[]
+                >((acc, m) => {
+                  const entry = selectedActivity.monthly[m.key];
+                  const prevTotal = acc.length > 0 ? acc[acc.length - 1].totalExpenditure : 0;
+                  const totalExpenditure = round2(prevTotal + safeNum(entry.financialActual));
+                  const rawCumulativePct =
+                    bd.revisedBudget > 0
+                      ? round2((totalExpenditure / bd.revisedBudget) * 100)
+                      : 0;
+                  const cappedAccompPct = Math.min(100, Math.max(0, rawCumulativePct));
+                  acc.push({
+                    month: m,
+                    entry,
+                    totalExpenditure,
+                    rawCumulativePct,
+                    cappedAccompPct,
+                  });
+                  return acc;
+                }, []);
+                const finalTotalExpenditure =
+                  monthlyRows.length > 0
+                    ? monthlyRows[monthlyRows.length - 1].totalExpenditure
+                    : 0;
+                const finalCappedPct =
+                  monthlyRows.length > 0
+                    ? monthlyRows[monthlyRows.length - 1].cappedAccompPct
+                    : 0;
                 return (
                   <>
                     <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
@@ -459,21 +493,22 @@ export function MonitoringEvaluationModule({
                             <th className="py-2 px-3 text-right">Phys. Target</th>
                             <th className="py-2 px-3 text-right">Phys. Actual</th>
                             <th className="py-2 px-3 text-right">Expenditure</th>
-                            <th className="py-2 px-3 min-w-[140px]">Accomplishment</th>
+                            <th className="py-2 px-3 text-right">Total Expenditure</th>
+                            <th className="py-2 px-3 min-w-[160px]">Accomplishment</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800 font-mono tabular-nums text-slate-800 dark:text-slate-200">
-                          {MONTHS.map((m) => {
-                            const entry = selectedActivity.monthly[m.key];
-                            const monthAccompPct =
-                              bd.revisedBudget > 0
-                                ? round2((entry.financialActual / bd.revisedBudget) * 100)
-                                : 0;
-                            const barPct = Math.min(100, Math.max(0, monthAccompPct));
-                            return (
-                              <tr key={m.key} className="hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                          {monthlyRows.map(
+                            ({
+                              month,
+                              entry,
+                              totalExpenditure,
+                              rawCumulativePct,
+                              cappedAccompPct,
+                            }) => (
+                              <tr key={month.key} className="hover:bg-slate-50 dark:hover:bg-slate-800/50">
                                 <td className="py-1.5 px-3 font-sans font-medium text-slate-800 dark:text-slate-200">
-                                  {m.label}
+                                  {month.label}
                                 </td>
                                 <td className="py-1.5 px-3 text-right">
                                   {formatQty(entry.physicalTarget)}
@@ -484,22 +519,36 @@ export function MonitoringEvaluationModule({
                                 <td className="py-1.5 px-3 text-right font-semibold text-blue-800 dark:text-sky-300">
                                   {formatPHP(entry.financialActual)}
                                 </td>
-                                <td className="py-1.5 px-3">
+                                <td className="py-1.5 px-3 text-right font-semibold text-[#163A5F] dark:text-sky-200">
+                                  {formatPHP(totalExpenditure)}
+                                </td>
+                                <td
+                                  className="py-1.5 px-3"
+                                  title={
+                                    rawCumulativePct > 100
+                                      ? `Cumulative Total Expenditure: ${formatPHP(totalExpenditure)} (${formatPct(rawCumulativePct)} of Revised Budget, capped at 100% on progress bar)`
+                                      : `Cumulative Total Expenditure: ${formatPHP(totalExpenditure)} / ${formatPHP(bd.revisedBudget)} = ${formatPct(cappedAccompPct)}`
+                                  }
+                                >
                                   <div className="flex items-center gap-2">
                                     <div className="h-1.5 flex-1 rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
                                       <div
-                                        className="h-full rounded-full bg-[#163A5F] dark:bg-sky-400 transition-all"
-                                        style={{ width: `${barPct}%` }}
+                                        className={`h-full rounded-full transition-all ${
+                                          cappedAccompPct >= 100
+                                            ? 'bg-emerald-600 dark:bg-emerald-400'
+                                            : 'bg-[#163A5F] dark:bg-sky-400'
+                                        }`}
+                                        style={{ width: `${cappedAccompPct}%` }}
                                       />
                                     </div>
-                                    <span className="w-12 text-right text-[10px] text-slate-700 dark:text-slate-300">
-                                      {formatPct(monthAccompPct)}
+                                    <span className="w-14 text-right text-[10px] text-slate-700 dark:text-slate-300">
+                                      {formatPct(cappedAccompPct)}
                                     </span>
                                   </div>
                                 </td>
                               </tr>
-                            );
-                          })}
+                            )
+                          )}
                         </tbody>
                         <tfoot>
                           <tr className="bg-slate-50 dark:bg-slate-800/80 border-t border-slate-200 dark:border-slate-700 font-mono font-bold tabular-nums text-slate-900 dark:text-slate-100">
@@ -513,17 +562,24 @@ export function MonitoringEvaluationModule({
                             <td className="py-2 px-3 text-right text-[#2563EB] dark:text-sky-300">
                               {formatPHP(selectedActivity.annualFinancialActual)}
                             </td>
+                            <td className="py-2 px-3 text-right text-[#163A5F] dark:text-sky-300">
+                              {formatPHP(finalTotalExpenditure)}
+                            </td>
                             <td className="py-2 px-3">
                               <div className="flex items-center gap-2">
                                 <div className="h-1.5 flex-1 rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
                                   <div
-                                    className="h-full rounded-full bg-[#163A5F] dark:bg-sky-400 transition-all"
+                                    className={`h-full rounded-full transition-all ${
+                                      finalCappedPct >= 100
+                                        ? 'bg-emerald-600 dark:bg-emerald-400'
+                                        : 'bg-[#163A5F] dark:bg-sky-400'
+                                    }`}
                                     style={{
                                       width: `${Math.min(100, Math.max(0, bd.accomplishmentPct))}%`,
                                     }}
                                   />
                                 </div>
-                                <span className="w-12 text-right text-[10px] text-[#163A5F] dark:text-sky-400">
+                                <span className="w-14 text-right text-[10px] text-[#163A5F] dark:text-sky-400">
                                   {formatPct(bd.accomplishmentPct)}
                                 </span>
                               </div>

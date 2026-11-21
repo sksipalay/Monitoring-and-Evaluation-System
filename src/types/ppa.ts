@@ -161,6 +161,7 @@ export interface FiscalYear {
 export interface ProgramSupplementalLog {
   id: string;
   type: 'ADD' | 'SUBTRACT';
+  supplementalNumber?: number;
   amount: number;
   signedAmount: number;
   notes?: string;
@@ -174,6 +175,7 @@ export interface Program {
   fiscalYear: string;
   aipRefCode: string;
   title: string;
+  targetOutputs?: string;
   sector: string;
   budget?: number;
   supplementalBudget?: number;
@@ -182,6 +184,7 @@ export interface Program {
   monthlyPhysicalTarget?: Partial<Record<MonthKey, number>>;
   sourceOfFund?: string;
   gadFund?: boolean;
+  status?: ImplementationStatus;
   officeId: string;
   officeName: string;
   parentProgramId: string | null;
@@ -198,6 +201,16 @@ export interface ActivityMilestone {
   status: MilestoneStatus;
   dueDate?: string;
   completedAt?: string;
+}
+
+export interface ActivityEvidenceItem {
+  id: string;
+  title: string;
+  note?: string;
+  url?: string;
+  addedByUid?: string;
+  addedByName?: string;
+  addedAt: string;
 }
 
 export interface Activity {
@@ -224,8 +237,10 @@ export interface Activity {
   supplementalBudget5: number;
   monthly: MonthlyMonitoringMap;
   status: ImplementationStatus;
+  completionPct?: number;
   remarks: string;
   milestones?: ActivityMilestone[];
+  evidence?: ActivityEvidenceItem[];
   orderIndex?: number;
   startDate?: string;
   endDate?: string;

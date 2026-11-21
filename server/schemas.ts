@@ -132,6 +132,26 @@ export const AuditLogsQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(5).max(200).optional(),
   action: z.string().trim().max(40).optional(),
   search: z.string().trim().max(160).optional(),
+  userUid: z.string().trim().max(120).optional(),
+  dateFrom: z
+    .string()
+    .trim()
+    .max(32)
+    .refine(
+      (s) => s === '' || /^\d{4}-\d{2}-\d{2}$/.test(s),
+      'Invalid start date format (expected YYYY-MM-DD)'
+    )
+    .optional(),
+  dateTo: z
+    .string()
+    .trim()
+    .max(32)
+    .refine(
+      (s) => s === '' || /^\d{4}-\d{2}-\d{2}$/.test(s),
+      'Invalid end date format (expected YYYY-MM-DD)'
+    )
+    .optional(),
+  tzOffsetMinutes: z.coerce.number().int().min(-840).max(840).optional(),
 });
 
 export const LoginSchema = z
@@ -220,6 +240,7 @@ export const FirebaseLoginSchema = z.object({
 export const ProgramSupplementalLogSchema = z.object({
   id: z.string().trim().min(1).max(120),
   type: z.enum(['ADD', 'SUBTRACT']),
+  supplementalNumber: z.number().int().min(1).max(50).optional(),
   amount: NonNegNumber,
   signedAmount: FiniteSignedNumber,
   notes: z.string().max(1000).optional(),
@@ -233,6 +254,7 @@ export const ProgramSchema = z.object({
   fiscalYear: z.string().trim().regex(/^\d{4}$/, 'Fiscal Year must be 4 digits'),
   aipRefCode: z.string().trim().min(1, 'AIP Reference Code is required.').max(80),
   title: z.string().trim().min(1, 'Program Title is required.').max(300),
+  targetOutputs: z.string().max(1000).optional().default(''),
   sector: z.string().trim().max(160).default('General Public Services'),
   budget: NonNegNumber.optional().default(0),
   supplementalBudget: FiniteSignedNumber.optional().default(0),
@@ -241,6 +263,7 @@ export const ProgramSchema = z.object({
   monthlyPhysicalTarget: MonthlyPhysicalTargetMapSchema,
   sourceOfFund: z.string().max(160).optional().default(''),
   gadFund: z.boolean().optional().default(false),
+  status: StatusEnum.optional().default('PENDING'),
   officeId: z.string().trim().min(1, 'Implementing Office ID is required.').max(120),
   officeName: z.string().trim().min(1, 'Implementing Office Name is required.').max(200),
   parentProgramId: z.string().max(120).nullable().optional().default(null),
@@ -258,6 +281,40 @@ export const ActivityMilestoneSchema = z.object({
   dueDate: SafeDateString.optional().default(''),
   completedAt: z.string().max(64).optional().default(''),
 });
+
+const SafeExternalUrl = z
+  .string()
+  .trim()
+  .max(2048)
+  .refine((val) => {
+    if (!val) return true;
+    try {
+      const parsed = new URL(val);
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }, 'External document link must be a valid http:// or https:// URL.');
+
+export const ActivityEvidenceSchema = z
+  .object({
+    id: z.string().trim().min(1, 'Evidence ID is required.').max(120),
+    title: z.string().trim().max(240).optional().default(''),
+    note: z.string().trim().max(2000).optional().default(''),
+    url: SafeExternalUrl.optional().default(''),
+    addedByUid: z.string().max(120).optional().default(''),
+    addedByName: z.string().max(160).optional().default(''),
+    addedAt: z.string().max(64).optional().default(''),
+  })
+  .superRefine((item, ctx) => {
+    if (!item.note?.trim() && !item.url?.trim() && !item.title?.trim()) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['note'],
+        message: 'Provide a supporting note or an external document URL.',
+      });
+    }
+  });
 
 export const ActivitySchema = z
   .object({
@@ -284,8 +341,10 @@ export const ActivitySchema = z
     supplementalBudget5: FiniteSignedNumber.optional().default(0),
     monthly: MonthlyMonitoringMapSchema,
     status: StatusEnum.default('PENDING'),
+    completionPct: z.number().finite().min(0).max(100).optional().default(0),
     remarks: z.string().max(4000).optional().default(''),
     milestones: z.array(ActivityMilestoneSchema).max(100).optional().default([]),
+    evidence: z.array(ActivityEvidenceSchema).max(100).optional().default([]),
     orderIndex: z.number().int().min(0).max(100_000).optional(),
     startDate: SafeDateString.optional().default(''),
     endDate: SafeDateString.optional().default(''),
