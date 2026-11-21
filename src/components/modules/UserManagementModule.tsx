@@ -43,7 +43,7 @@ import {
 import { buildAuditLog, dataService } from '../../services/dataService';
 import { useModalFocusTrap } from '../../hooks/useModalFocusTrap';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
-import { buildCsvBlob } from '../../utils/csvExport';
+import { buildCsvBlob, sanitizeCsvFileSegment } from '../../utils/csvExport';
 import { triggerBlobDownload } from '../../utils/excelService';
 import {
   ALL_SIDEBAR_MODULES,
@@ -196,6 +196,7 @@ export function UserManagementModule({
   } | null>(null);
   const [tokenCopied, setTokenCopied] = useState(false);
   const [verifyingChain, setVerifyingChain] = useState(false);
+  const [exportingAuditCsv, setExportingAuditCsv] = useState(false);
   const [chainIntegrity, setChainIntegrity] = useState<AuditIntegrityResult | null>(null);
   const [expandedDiffIds, setExpandedDiffIds] = useState<Record<string, boolean>>({});
   const modalRef = useModalFocusTrap<HTMLDivElement>(modalOpen, () => setModalOpen(false));
@@ -242,7 +243,7 @@ export function UserManagementModule({
         label: `${u.displayName} (${u.email})`,
       });
     }
-    for (const log of auditLogs) {
+    for (const log of [...auditLogs, ...auditPageData.rows]) {
       if (log.userUid && !map.has(log.userUid)) {
         map.set(log.userUid, {
           uid: log.userUid,
@@ -251,7 +252,7 @@ export function UserManagementModule({
       }
     }
     return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label));
-  }, [users, auditLogs]);
+  }, [users, auditLogs, auditPageData.rows]);
 
   const hasActiveAuditFilters =
     Boolean(auditSearch.trim()) ||
@@ -596,6 +597,135 @@ export function UserManagementModule({
     );
   };
 
+  const handleExportAuditLogsCsv = async () => {
+    setExportingAuditCsv(true);
+    try {
+      const tzOffsetMinutes = new Date().getTimezoneOffset();
+      const firstPage = await dataService.getAuditLogsPaginated({
+        page: 1,
+        pageSize: 200,
+        action: auditActionFilter,
+        search: auditSearch,
+        userUid: auditUserFilter,
+        dateFrom: auditDateFrom,
+        dateTo: auditDateTo,
+        tzOffsetMinutes,
+      });
+
+      const allLogs: AuditLog[] = [...firstPage.auditLogs];
+      const maxPagesToFetch = Math.min(firstPage.totalPages || 1, 100);
+      for (let p = 2; p <= maxPagesToFetch; p += 1) {
+        const nextPage = await dataService.getAuditLogsPaginated({
+          page: p,
+          pageSize: 200,
+          action: auditActionFilter,
+          search: auditSearch,
+          userUid: auditUserFilter,
+          dateFrom: auditDateFrom,
+          dateTo: auditDateTo,
+          tzOffsetMinutes,
+        });
+        allLogs.push(...nextPage.auditLogs);
+      }
+
+      if (allLogs.length === 0) {
+        onNotify?.(
+          'error',
+          hasActiveAuditFilters
+            ? 'No audit log entries match the current filters to export.'
+            : 'No audit log entries available to export.'
+        );
+        return;
+      }
+
+      const headers = [
+        'Audit ID',
+        'Timestamp (Local)',
+        'Timestamp (ISO)',
+        'User UID',
+        'User Name',
+        'User Email',
+        'User Role',
+        'Office',
+        'Action',
+        'Entity Type',
+        'Entity ID',
+        'Summary',
+        'Details',
+        'Field Changes',
+        'Previous Hash',
+        'Entry Hash',
+      ];
+
+      const rows = allLogs.map((l) => {
+        const changesText = Array.isArray(l.changes)
+          ? l.changes
+              .map((c) => `${c.field}: ${c.before || '—'} -> ${c.after || '—'}`)
+              .join(' | ')
+          : '';
+        return [
+          l.id,
+          l.timestamp ? new Date(l.timestamp).toLocaleString('en-PH') : '',
+          l.timestamp,
+          l.userUid,
+          l.userName,
+          l.userEmail,
+          ROLE_LABELS[l.userRole] || l.userRole,
+          l.userOfficeName || '',
+          l.action,
+          l.entityType,
+          l.entityId,
+          l.summary,
+          l.details || '',
+          changesText,
+          l.prevHash || '',
+          l.entryHash || '',
+        ];
+      });
+
+      const blob = buildCsvBlob(headers, rows);
+      const dateStamp = new Date().toISOString().slice(0, 10);
+      const selectedUserOption =
+        auditUserFilter !== 'ALL'
+          ? auditUserOptions.find((u) => u.uid === auditUserFilter)
+          : undefined;
+      const userSeg = selectedUserOption
+        ? `-${sanitizeCsvFileSegment(selectedUserOption.label.split(' (')[0] || selectedUserOption.uid)}`
+        : '';
+      const fileName = `LGU-Bula-Audit-Logs${userSeg}-${dateStamp}.csv`;
+      triggerBlobDownload(blob, fileName);
+
+      const audit = buildAuditLog(
+        currentUser,
+        'EXPORT',
+        'AuditLog',
+        'audit-logs-csv',
+        `Exported ${allLogs.length} audit log entr${allLogs.length === 1 ? 'y' : 'ies'} to CSV`,
+        fileName
+      );
+      void dataService
+        .logAudit(audit)
+        .then((res) => {
+          if (res?.auditLog) {
+            onUserUpdated?.(currentUser, res.auditLog);
+          }
+        })
+        .catch(() => {});
+
+      onNotify?.(
+        'success',
+        `Exported ${allLogs.length} audit log entr${allLogs.length === 1 ? 'y' : 'ies'} to ${fileName}.`
+      );
+    } catch (err) {
+      onNotify?.(
+        'error',
+        err instanceof Error ? err.message : 'Unable to export audit logs to CSV.'
+      );
+    } finally {
+      setExportingAuditCsv(false);
+    }
+  };
+
   const handleRevokeActiveSession = async (session: AdminActiveSession) => {
     if (session.userRole === 'SUPER_ADMIN' && !isSuperAdmin) {
       onNotify?.('error', 'Only a Super Administrator can terminate Super Administrator sessions.');
@@ -660,79 +790,79 @@ export function UserManagementModule({
           </button>
         </div>
 
-        {activeTab === 'users' && (
-          <div className="flex flex-wrap items-center gap-2">
-            <select
-              aria-label="Filter by approval status"
-              value={approvalFilter}
-              onChange={(e) => setApprovalFilter(e.target.value as 'ALL' | ApprovalStatus)}
-              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-xs focus:border-[#2563EB] focus:outline-none transition-colors"
-            >
-              <option value="ALL">All Statuses</option>
-              <option value="APPROVED">Approved</option>
-              <option value="PENDING">Pending ({pendingCount})</option>
-              <option value="REJECTED">Rejected</option>
-            </select>
-            <select
-              aria-label="Filter by office"
-              value={officeFilter}
-              onChange={(e) => setOfficeFilter(e.target.value)}
-              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-xs focus:border-[#2563EB] focus:outline-none transition-colors"
-            >
-              <option value="ALL">All Offices ({users.length})</option>
-              {offices.map((o) => (
-                <option key={o.id} value={o.id}>
-                  {o.code} — {o.name}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              disabled={filteredUsers.length === 0}
-              onClick={handleExportUsersCsv}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
-              title="Export visible system users and roles as CSV"
-            >
-              <Download className="h-3.5 w-3.5 text-[#163A5F] dark:text-sky-400" aria-hidden="true" />
-              <span>Export Users CSV</span>
-            </button>
-            {missingOfficeCount > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          {activeTab === 'users' && (
+            <>
+              <select
+                aria-label="Filter by approval status"
+                value={approvalFilter}
+                onChange={(e) => setApprovalFilter(e.target.value as 'ALL' | ApprovalStatus)}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-xs focus:border-[#2563EB] focus:outline-none transition-colors"
+              >
+                <option value="ALL">All Statuses</option>
+                <option value="APPROVED">Approved</option>
+                <option value="PENDING">Pending ({pendingCount})</option>
+                <option value="REJECTED">Rejected</option>
+              </select>
+              <select
+                aria-label="Filter by office"
+                value={officeFilter}
+                onChange={(e) => setOfficeFilter(e.target.value)}
+                className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-xs focus:border-[#2563EB] focus:outline-none transition-colors"
+              >
+                <option value="ALL">All Offices ({users.length})</option>
+                {offices.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.code} — {o.name}
+                  </option>
+                ))}
+              </select>
               <button
                 type="button"
-                disabled={provisioning}
-                onClick={async () => {
-                  setProvisioning(true);
-                  try {
-                    await onProvisionOfficeAccounts();
-                  } catch {
-                    /* Error notification handled in parent handler */
-                  } finally {
-                    setProvisioning(false);
-                  }
-                }}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-[#163A5F] dark:border-[#2563EB] px-3.5 py-2 text-xs font-semibold text-[#163A5F] dark:text-sky-400 hover:bg-blue-50 dark:hover:bg-sky-950/40 transition-colors disabled:opacity-50"
+                disabled={filteredUsers.length === 0}
+                onClick={handleExportUsersCsv}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
+                title="Export visible system users and roles as CSV"
               >
-                <Building2 className="h-4 w-4" />
-                <span>
-                  {provisioning
-                    ? 'Provisioning...'
-                    : `Create Missing Office Accounts (${missingOfficeCount})`}
-                </span>
+                <Download className="h-3.5 w-3.5 text-[#163A5F] dark:text-sky-400" aria-hidden="true" />
+                <span>Export Users CSV</span>
               </button>
-            )}
-            <button
-              type="button"
-              onClick={openNew}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-[#163A5F] hover:bg-[#1E4D7B] dark:bg-[#2563EB] dark:hover:bg-[#1D4ED8] px-4 py-2 text-xs font-semibold text-white transition-colors shadow-xs"
-            >
-              <Plus className="h-4 w-4" />
-              <span>Add Authorized User</span>
-            </button>
-          </div>
-        )}
+              {missingOfficeCount > 0 && (
+                <button
+                  type="button"
+                  disabled={provisioning}
+                  onClick={async () => {
+                    setProvisioning(true);
+                    try {
+                      await onProvisionOfficeAccounts();
+                    } catch {
+                      /* Error notification handled in parent handler */
+                    } finally {
+                      setProvisioning(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#163A5F] dark:border-[#2563EB] px-3.5 py-2 text-xs font-semibold text-[#163A5F] dark:text-sky-400 hover:bg-blue-50 dark:hover:bg-sky-950/40 transition-colors disabled:opacity-50"
+                >
+                  <Building2 className="h-4 w-4" />
+                  <span>
+                    {provisioning
+                      ? 'Provisioning...'
+                      : `Create Missing Office Accounts (${missingOfficeCount})`}
+                  </span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={openNew}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[#163A5F] hover:bg-[#1E4D7B] dark:bg-[#2563EB] dark:hover:bg-[#1D4ED8] px-4 py-2 text-xs font-semibold text-white transition-colors shadow-xs"
+              >
+                <Plus className="h-4 w-4" />
+                <span>Add Authorized User</span>
+              </button>
+            </>
+          )}
 
-        {activeTab === 'sessions' && (
-          <div className="flex items-center gap-2">
+          {activeTab === 'sessions' && (
             <button
               type="button"
               disabled={sessionsLoading}
@@ -742,8 +872,26 @@ export function UserManagementModule({
               <RefreshCw className={`h-3.5 w-3.5 ${sessionsLoading ? 'animate-spin' : ''}`} aria-hidden="true" />
               <span>{sessionsLoading ? 'Refreshing...' : 'Refresh Sessions'}</span>
             </button>
-          </div>
-        )}
+          )}
+
+          <button
+            type="button"
+            disabled={exportingAuditCsv}
+            onClick={() => void handleExportAuditLogsCsv()}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
+            title={
+              hasActiveAuditFilters
+                ? 'Export filtered audit log history as CSV'
+                : 'Export current audit log history as CSV'
+            }
+          >
+            <Download
+              className={`h-3.5 w-3.5 text-[#163A5F] dark:text-sky-400 ${exportingAuditCsv ? 'animate-pulse' : ''}`}
+              aria-hidden="true"
+            />
+            <span>{exportingAuditCsv ? 'Exporting Audit Logs...' : 'Export Audit Logs'}</span>
+          </button>
+        </div>
       </div>
 
       {activeTab === 'users' && pendingCount > 0 && (
@@ -1295,16 +1443,16 @@ export function UserManagementModule({
                 </div>
               </div>
 
-              <div className="min-w-[180px] max-w-[240px]">
+              <div className="min-w-[200px] max-w-[260px]">
                 <label
                   htmlFor="audit-user-filter"
                   className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
                 >
-                  User
+                  User Account
                 </label>
                 <select
                   id="audit-user-filter"
-                  aria-label="Filter audit logs by user"
+                  aria-label="Filter audit logs by user account"
                   value={auditUserFilter}
                   onChange={(e) => {
                     setAuditUserFilter(e.target.value);
@@ -1312,7 +1460,7 @@ export function UserManagementModule({
                   }}
                   className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 px-3 py-1.5 text-sm focus:border-[#2563EB] focus:outline-none transition-colors"
                 >
-                  <option value="ALL">All Users</option>
+                  <option value="ALL">All User Accounts</option>
                   {auditUserOptions.map((u) => (
                     <option key={u.uid} value={u.uid}>
                       {u.label}

@@ -433,9 +433,9 @@ export function AccomplishmentStatusModule({
                 <th className="py-3 px-4">Program Title &amp; Implementing Office</th>
                 <th className="py-3 px-4 text-right">Activities</th>
                 <th className="py-3 px-4 text-right">Revised Budget</th>
+                <th className="py-3 px-4 text-right">Total Expenditure</th>
                 <th className="py-3 px-4 text-right">Phys. %</th>
                 <th className="py-3 px-4 text-right">Fin. %</th>
-                <th className="py-3 px-4 min-w-[180px]">Avg. Completion</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-[13px] text-slate-800 dark:text-slate-200">
@@ -449,11 +449,6 @@ export function AccomplishmentStatusModule({
                 filteredPrograms.map(({ program: prog, activities: progActs }) => {
                   const progSummary = programSummaryMap.get(prog.id);
                   const isExpanded = progActs.length > 0 && !collapsedProgramIds[prog.id];
-                  const avgCompletionPct =
-                    progActs.length > 0
-                      ? progActs.reduce((sum, a) => sum + clampPct(a.completionPct ?? 0), 0) /
-                        progActs.length
-                      : 0;
 
                   return (
                     <Fragment key={prog.id}>
@@ -501,6 +496,9 @@ export function AccomplishmentStatusModule({
                         <td className="py-3 px-4 text-right font-mono font-semibold tabular-nums whitespace-nowrap">
                           {formatPHP(progSummary?.revisedBudget ?? 0)}
                         </td>
+                        <td className="py-3 px-4 text-right font-mono font-semibold text-slate-800 dark:text-slate-200 tabular-nums whitespace-nowrap">
+                          {formatPHP(progSummary?.annualFinancialActual ?? 0)}
+                        </td>
                         <td className="py-3 px-4 text-right font-mono font-medium text-[#163A5F] dark:text-sky-400 tabular-nums whitespace-nowrap">
                           {progSummary && progSummary.annualPhysicalTarget > 0
                             ? formatPct(progSummary.physicalAccomplishmentPct)
@@ -508,27 +506,6 @@ export function AccomplishmentStatusModule({
                         </td>
                         <td className="py-3 px-4 text-right font-mono font-medium text-[#163A5F] dark:text-sky-400 tabular-nums whitespace-nowrap">
                           {formatPct(progSummary?.budgetUtilizationPct ?? 0)}
-                        </td>
-                        <td className="py-3 px-4 whitespace-nowrap">
-                          {progActs.length === 0 ? (
-                            <span className="text-xs text-slate-400">—</span>
-                          ) : (
-                            <div className="flex items-center gap-2">
-                              <div className="h-2 flex-1 rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
-                                <div
-                                  className={`h-full rounded-full transition-all ${
-                                    avgCompletionPct >= 100
-                                      ? 'bg-emerald-600 dark:bg-emerald-400'
-                                      : 'bg-[#163A5F] dark:bg-sky-400'
-                                  }`}
-                                  style={{ width: `${Math.min(100, Math.max(0, avgCompletionPct))}%` }}
-                                />
-                              </div>
-                              <span className="w-14 text-right font-mono text-xs font-semibold text-slate-700 dark:text-slate-300 tabular-nums">
-                                {formatPct(avgCompletionPct)}
-                              </span>
-                            </div>
-                          )}
                         </td>
                       </tr>
 
@@ -605,66 +582,33 @@ export function AccomplishmentStatusModule({
                                         </div>
 
                                         <div>
-                                          <div className="flex items-center justify-between gap-2 mb-1">
-                                            <label
-                                              htmlFor={`pct-${act.id}`}
-                                              className="text-[11px] font-medium text-slate-600 dark:text-slate-400"
-                                            >
-                                              Percentage Complete
-                                            </label>
-                                            <div className="flex items-center gap-1">
-                                              <input
-                                                id={`pct-${act.id}`}
-                                                type="number"
-                                                min={0}
-                                                max={100}
-                                                step={1}
-                                                value={draft.completionPct}
-                                                disabled={isSavingAct || !canEditStatusRemarks}
-                                                onChange={(e) => {
-                                                  const raw = e.target.value;
-                                                  const parsed = raw === '' ? 0 : Number(raw);
-                                                  updateDraft(act, {
-                                                    completionPct: clampPct(parsed),
-                                                  });
-                                                }}
-                                                className="no-print w-16 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-0.5 text-right font-mono text-xs font-semibold text-slate-900 dark:text-slate-100 focus:border-[#2563EB] focus:outline-none disabled:opacity-60"
-                                                aria-label={`Percentage complete for ${act.referenceNumber}`}
-                                              />
-                                              <span className="font-mono text-xs font-semibold text-slate-600 dark:text-slate-300">
-                                                %
-                                              </span>
-                                            </div>
-                                          </div>
-                                          {canEditStatusRemarks && (
-                                            <input
-                                              type="range"
-                                              min={0}
-                                              max={100}
-                                              step={1}
-                                              value={draft.completionPct}
-                                              disabled={isSavingAct}
-                                              onChange={(e) =>
-                                                updateDraft(act, {
-                                                  completionPct: clampPct(Number(e.target.value)),
-                                                })
-                                              }
-                                              aria-label={`Percentage complete slider for ${act.referenceNumber}`}
-                                              className="no-print w-full accent-[#163A5F] dark:accent-sky-400 cursor-pointer h-1.5"
-                                            />
-                                          )}
-                                          <div className="mt-1 h-2 w-full rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
-                                            <div
-                                              className={`h-full rounded-full transition-all ${
-                                                draft.completionPct >= 100
-                                                  ? 'bg-emerald-600 dark:bg-emerald-400'
-                                                  : draft.completionPct > 0
-                                                    ? 'bg-[#2563EB] dark:bg-sky-400'
-                                                    : 'bg-slate-400 dark:bg-slate-600'
-                                              }`}
-                                              style={{ width: `${clampPct(draft.completionPct)}%` }}
-                                            />
-                                          </div>
+                                          {(() => {
+                                            const financialPct = clampPct(bd.accomplishmentPct);
+                                            return (
+                                              <>
+                                                <div className="flex items-center justify-between gap-2 mb-1">
+                                                  <span className="text-[11px] font-medium text-slate-600 dark:text-slate-400">
+                                                    Financial Accomplishment
+                                                  </span>
+                                                  <span className="font-mono text-xs font-semibold text-[#163A5F] dark:text-sky-400 tabular-nums">
+                                                    {formatPct(bd.accomplishmentPct)}
+                                                  </span>
+                                                </div>
+                                                <div className="mt-1 h-2 w-full rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
+                                                  <div
+                                                    className={`h-full rounded-full transition-all ${
+                                                      financialPct >= 100
+                                                        ? 'bg-emerald-600 dark:bg-emerald-400'
+                                                        : financialPct > 0
+                                                          ? 'bg-[#2563EB] dark:bg-sky-400'
+                                                          : 'bg-slate-400 dark:bg-slate-600'
+                                                    }`}
+                                                    style={{ width: `${financialPct}%` }}
+                                                  />
+                                                </div>
+                                              </>
+                                            );
+                                          })()}
                                         </div>
                                       </div>
 
